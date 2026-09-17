@@ -4,7 +4,9 @@
   python main.py --mode check        # 檢查 Secrets、YouTube、試算表、Gemini 設定（不轉錄、不花生成額度）
   python main.py                     # daily：抓今天（台灣時間）那一集；試算表還沒資料時自動改做 init
   python main.py --mode init         # 抓頻道最新 5 場已結束直播中尚未寫入的
-  python main.py --video-id XXXX     # 只處理指定影片（不受「每天失敗次數」限制）
+  python main.py --video-id XXXX     # 只處理指定影片
+
+「同一集每天最多失敗幾次」的限制只套用在排程觸發的執行；手動執行不受限制。
 
 結束代碼：0 = 正常（包含「今天還沒好，下次再查」），1 = 有錯誤（GitHub 會寄 email 通知）。
 """
@@ -105,6 +107,7 @@ def run_transcribe(args: argparse.Namespace) -> int:
         return 0
 
     cfg = config.load_settings()
+    scheduled = os.getenv("GITHUB_EVENT_NAME") == "schedule"
     now = datetime.now(config.TAIPEI)
     youtube = YouTubeClient(cfg.youtube_api_key)
     store = SheetStore(cfg.spreadsheet_id, config.parse_service_account(cfg.service_account_json))
@@ -146,7 +149,9 @@ def run_transcribe(args: argparse.Namespace) -> int:
                      stream.status_text(now, cfg.ready_delay_minutes))
             continue
         attempts = store.failed_attempts_today(stream.video_id)
-        if mode != "manual" and attempts >= cfg.max_attempts_per_day:
+        # 次數限制只用在「排程」：避免每 5 分鐘自動重試浪費額度、寄一堆失敗通知信。
+        # 在 Actions 頁面手動按「Run workflow」是刻意要重試，不受限制。
+        if scheduled and attempts >= cfg.max_attempts_per_day:
             # 不回傳錯誤碼，避免之後每 5 分鐘都寄一次失敗通知信
             log.warning("%s %s 今天已失敗 %d 次，暫停重試（請查看「執行紀錄」工作表）",
                         stream.episode_date, stream.video_id, attempts)

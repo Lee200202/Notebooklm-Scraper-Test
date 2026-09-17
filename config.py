@@ -145,8 +145,9 @@ def load_settings(strict: bool = True) -> Settings:
         gemini_model=env("GEMINI_MODEL", "gemini-3.8-flash"),
         # 每段送給 Gemini 的影片長度；免費方案每天約 20 次請求，30 分鐘一段最省
         segment_minutes=_number("SEGMENT_MINUTES", 30, int, 5),
-        # 逐字稿只需要聲音，畫面每 5 秒取 1 張以節省 token；設 0 代表用 API 預設值
-        video_fps=_number("VIDEO_FPS", 0.2, float, 0),
+        # 預設 0 = 不指定 fps（API 預設每秒 1 張畫面）。實測 fps=0.2 雖然省 token，
+        # 但部分影片片段會讓 Gemini 回傳 HTTP 400「Request contains an invalid argument.」
+        video_fps=_number("VIDEO_FPS", 0, float, 0),
         vocabulary=tuple(w.strip() for w in env("CUSTOM_VOCABULARY", DEFAULT_VOCABULARY).split(",") if w.strip()),
         max_attempts_per_day=_number("MAX_ATTEMPTS_PER_DAY", 3, int, 1),
         spreadsheet_id=env("SPREADSHEET_ID"),

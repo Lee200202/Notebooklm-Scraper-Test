@@ -168,6 +168,13 @@ def old(i):
     return f"oldVideo{i:03d}"
 
 
+INVALID_ARGUMENT = (400, {"error": {"message": "Request contains an invalid argument.", "code": "invalid_request"}})
+
+
+def processing_of(request):
+    return request["input"][0]["content"][0]["processing"]
+
+
 class PipelineTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -276,7 +283,7 @@ class PipelineTest(unittest.TestCase):
 
     def test_empty_variables_fall_back_to_defaults(self):
         cfg = config.load_settings()
-        self.assertEqual((cfg.gemini_model, cfg.segment_minutes, cfg.video_fps), (MODEL, 30, 0.2))
+        self.assertEqual((cfg.gemini_model, cfg.segment_minutes, cfg.video_fps), (MODEL, 30, 0))
         self.assertNotIn("test-gemini", repr(cfg))
         with mock.patch.dict(os.environ, {"SEGMENT_MINUTES": "abc"}):
             with self.assertRaises(ConfigError):
@@ -296,7 +303,7 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(request["generation_config"], {"thinking_level": "low", "max_output_tokens": 65536})
         self.assertEqual(video["uri"], f"https://www.youtube.com/watch?v={old(4)}")
         self.assertEqual(video["resolution"], "low")
-        self.assertEqual(video["processing"], {"type": "static", "start_offset": "0s", "end_offset": "1800s", "fps": 0.2})
+        self.assertEqual(video["processing"], {"type": "static", "start_offset": "0s", "end_offset": "1800s"})  # 預設不帶 fps
         self.assertEqual([r["input"][0]["content"][0]["processing"]["end_offset"] for r in FakeGemini.requests[:3]],
                          ["1800s", "3600s", "3995s"])
         self.assertIn("【1:00:00 – 1:06:35】", self.rows()[0][11])
@@ -339,35 +346,51 @@ class PipelineTest(unittest.TestCase):
                     r["input"][0]["content"][0]["processing"]["end_offset"]) for r in FakeGemini.requests]
         self.assertEqual(offsets, [("0s", "1800s"), ("0s", "900s"), ("900s", "1800s"), ("1800s", "3600s"), ("3600s", "3995s")])
 
-    def test_rejected_fps_falls_back_once(self):
+    def test_fps_rejected_by_name_is_disabled_for_all_segments(self):
         self.set_channel(count=1)
-        FakeGemini.reject_fps = True
-        self.assertEqual(self.run_main("--video-id", TODAY)[0], 0)
-        self.assertEqual(len(FakeGemini.requests), 3)
-        self.assertTrue(all("fps" not in r["input"][0]["content"][0]["processing"] for r in FakeGemini.requests))
+        FakeGemini.reject_fps = True  # 錯誤訊息明確寫 "Invalid fps"
+        with mock.patch.dict(os.environ, {"VIDEO_FPS": "0.2"}):
+            self.assertEqual(self.run_main("--video-id", TODAY)[0], 0)
+        self.assertEqual(FakeGemini.post_calls, 4)  # 只被拒絕 1 次，之後的片段都不再帶 fps
+        self.assertTrue(all("fps" not in processing_of(r) for r in FakeGemini.requests))
+
+    def test_generic_400_with_fps_retries_that_segment_without_fps(self):
+        # 重現 GitHub 上的實際情況：帶 fps=0.2 的片段在輪詢時一直回傳 400，不帶 fps 則成功
+        self.set_channel(count=1)
+
+        def fail_first_segment_with_fps(index, count):
+            p = processing_of(FakeGemini.requests[index])
+            return INVALID_ARGUMENT if "fps" in p and p["start_offset"] == "0s" and count == 2 else None
+
+        FakeGemini.poll_error = staticmethod(fail_first_segment_with_fps)
+        with mock.patch.dict(os.environ, {"VIDEO_FPS": "0.2"}):
+            self.assertEqual(self.run_main("--video-id", TODAY)[0], 0)
+        self.assertEqual([(processing_of(r)["start_offset"], "fps" in processing_of(r)) for r in FakeGemini.requests],
+                         [("0s", True), ("0s", False), ("1800s", True), ("3600s", True)])
+        self.assertEqual(self.rows()[0][3], TODAY)
 
     def test_failures_pause_scheduled_runs_but_not_manual_runs(self):
         self.set_channel(count=2, live="live")
         self.run_main("--mode", "init")  # 今天還在直播，init 只會寫入舊的那集
         self.videos[TODAY] = make_video(TODAY, self.today, 3995)
         FakeGemini.final_status = staticmethod(lambda index: "failed")
-        codes = [self.run_main()[0] for _ in range(4)]
+        with mock.patch.dict(os.environ, {"GITHUB_EVENT_NAME": "schedule"}):
+            codes = [self.run_main()[0] for _ in range(4)]
         self.assertEqual(codes, [1, 1, 1, 0])  # 第 4 次暫停，不再寄失敗通知
         self.assertEqual(self.log_results()[-3:], ["失敗"] * 3)
 
+        # 在 Actions 頁面手動執行 init：不受每日失敗次數限制
         FakeGemini.final_status = staticmethod(lambda index: "completed")
-        self.assertEqual(self.run_main("--video-id", TODAY)[0], 0)
+        with mock.patch.dict(os.environ, {"GITHUB_EVENT_NAME": "workflow_dispatch"}):
+            self.assertEqual(self.run_main("--mode", "init")[0], 0)
         self.assertEqual(self.rows()[-1][3], TODAY)
 
-    def test_transient_400_while_polling_is_retried_and_keeps_fps(self):
-        # 實際在 GitHub 上遇到的錯誤：輪詢結果時回傳 400，重新送出即成功，且不該因此停用 fps
+    def test_transient_400_without_fps_is_retried(self):
+        # 不帶 fps 偶爾也會在輪詢時回傳一次 400，重送同一段即可
         self.set_channel(count=1)
-        invalid = (400, {"error": {"message": "Request contains an invalid argument.", "code": "invalid_request"}})
-        FakeGemini.poll_error = staticmethod(lambda index, count: invalid if index == 1 and count == 2 else None)
+        FakeGemini.poll_error = staticmethod(lambda index, count: INVALID_ARGUMENT if index == 1 and count == 2 else None)
         self.assertEqual(self.run_main("--video-id", TODAY)[0], 0)
-        processings = [r["input"][0]["content"][0]["processing"] for r in FakeGemini.requests]
-        self.assertEqual([p["end_offset"] for p in processings], ["1800s", "3600s", "3600s", "3995s"])
-        self.assertTrue(all(p.get("fps") == 0.2 for p in processings))
+        self.assertEqual([processing_of(r)["end_offset"] for r in FakeGemini.requests], ["1800s", "3600s", "3600s", "3995s"])
         self.assertEqual(self.rows()[0][3], TODAY)
 
     def test_failed_status_is_retried_within_the_run(self):

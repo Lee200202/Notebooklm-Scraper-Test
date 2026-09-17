@@ -93,13 +93,14 @@ class Transcriber:
     def _request(self, video_url: str, start: int, end: int) -> tuple[str, bool]:
         """送出一段影片並等待結果，回傳 (逐字稿, 是否完整)。
 
-        Gemini 的 YouTube 影片處理偶爾會暫時失敗：實測在輪詢結果時回傳
-        HTTP 400「Request contains an invalid argument.」，重新送出同樣的請求就會成功。
-        所以除了金鑰／權限／模型錯誤之外，一律等待後重新送出，最多 MAX_SEGMENT_ATTEMPTS 次。
+        Gemini 讀取 YouTube 影片時可能回傳 HTTP 400「Request contains an invalid argument.」
+        （通常在輪詢結果時才出現）。實測同一個片段：
+          - 帶 fps=0.2 → 重送幾次都失敗；不帶 fps → 成功
+          - 不帶 fps 偶爾也會失敗一次，重送即可
+        所以：帶 fps 的請求失敗後，這一段改成不帶 fps 重送；其他錯誤（金鑰、權限、模型不存在除外）
+        等待後重送，最多 MAX_SEGMENT_ATTEMPTS 次。
         """
-        processing = {"type": "static", "start_offset": f"{start}s", "end_offset": f"{end}s"}
-        if self.video_fps > 0:
-            processing["fps"] = self.video_fps
+        use_fps = self.video_fps > 0
         prompt = (
             f"請聽打這段影片 {_hms(start)} 到 {_hms(end)} 的完整逐字稿。\n"
             f"可能出現的專有名詞：{'、'.join(self.vocabulary)}"
@@ -111,7 +112,11 @@ class Transcriber:
                 wait = RETRY_WAIT_SECONDS[min(attempt - 2, len(RETRY_WAIT_SECONDS) - 1)]
                 log.info("  %d 秒後重新送出", wait)
                 time.sleep(wait)
-            log.info("  Gemini 轉錄 %s–%s（第 %d 次）", _hms(start), _hms(end), attempt)
+            processing = {"type": "static", "start_offset": f"{start}s", "end_offset": f"{end}s"}
+            if use_fps:
+                processing["fps"] = self.video_fps
+            log.info("  Gemini 轉錄 %s–%s（第 %d 次%s）", _hms(start), _hms(end), attempt,
+                     f"，fps={self.video_fps}" if use_fps else "")
 
             stage = "送出請求"
             try:
@@ -134,12 +139,10 @@ class Transcriber:
                     raise
                 if status == 429 and _is_daily_quota(message):
                     raise QuotaExhausted(f"Gemini 每日額度已用完：{message[:300]}") from exc
-                # 只有錯誤訊息明確提到 fps 才停用；不能把所有 400 都當成 fps 問題
-                if status == 400 and "fps" in processing and "fps" in message.lower():
-                    log.warning("  API 不接受 fps=%s，改用預設取樣", processing.pop("fps"))
-                    self.video_fps = 0
                 last_error, last_status = f"{stage}時發生錯誤（HTTP {status}）：{message[:300]}", status
                 log.warning("  %s", last_error)
+                if status == 400 and use_fps:
+                    use_fps = self._drop_fps(message)
                 continue
 
             usage = getattr(interaction, "usage", None)
@@ -162,11 +165,26 @@ class Transcriber:
             )
             last_status = None
             log.warning("  %s", last_error)
+            if use_fps:
+                use_fps = self._drop_fps(last_error)
 
         if last_status == 429:
             # 每分鐘額度在等待 2 分鐘後應已恢復；仍然 429 代表是每日（或更長週期）的額度
             raise QuotaExhausted(f"Gemini 額度不足，重試 {MAX_SEGMENT_ATTEMPTS} 次仍回傳 429：{last_error}")
         raise RuntimeError(f"Gemini 轉錄 {_hms(start)}–{_hms(end)} 重試 {MAX_SEGMENT_ATTEMPTS} 次仍失敗。最後錯誤：{last_error}")
+
+    def _drop_fps(self, message: str) -> bool:
+        """帶 fps 的請求失敗後改成不帶 fps。回傳新的 use_fps（一律 False）。
+
+        錯誤訊息明確提到 fps（API 不接受這個值）→ 之後所有片段都不再帶 fps；
+        否則只有這一段改成不帶 fps，下一段仍照設定嘗試。
+        """
+        if "fps" in message.lower():
+            log.warning("  API 不接受 fps=%s，之後所有片段改用預設取樣", self.video_fps)
+            self.video_fps = 0
+        else:
+            log.warning("  這一段改成不指定 fps 重送（fps 會讓部分影片片段處理失敗）")
+        return False
 
     def _wait(self, interaction):
         deadline = time.monotonic() + SEGMENT_TIMEOUT_SECONDS
