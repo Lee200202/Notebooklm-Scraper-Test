@@ -173,8 +173,16 @@ def run_transcribe(args: argparse.Namespace) -> int:
     return 1 if had_error else 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    # GitHub 主機的時區是 UTC，log 時間改用台灣時間顯示才不會混淆
+    for handler in logging.getLogger().handlers:
+        if handler.formatter:
+            handler.formatter.converter = lambda ts: datetime.fromtimestamp(ts, config.TAIPEI).timetuple()
+
+
+def main(argv: list[str] | None = None) -> int:
+    setup_logging()
     # SDK 每次輪詢都會印一行 HTTP 請求，只保留警告以上，log 比較好讀
     logging.getLogger("httpx").setLevel(logging.WARNING)
     args = parse_args(argv)

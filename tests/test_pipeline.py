@@ -41,11 +41,14 @@ SERVICE_ACCOUNT = {
 
 # ---------------------------------------------------------------- 假的 Gemini API
 class FakeGemini(BaseHTTPRequestHandler):
-    requests: list = []
+    requests: list = []   # 被接受的請求
+    post_calls = 0        # 所有 POST（包含被拒絕的）
     polls: dict = {}
     reject_fps = False
     daily_quota = False
     final_status = staticmethod(lambda index: "completed")  # 第 index 個請求的最終狀態
+    post_error = staticmethod(lambda call_no: None)          # 回傳 (HTTP 狀態碼, JSON) 模擬送出失敗
+    poll_error = staticmethod(lambda index, count: None)     # 回傳 (HTTP 狀態碼, JSON) 模擬輪詢失敗
 
     def log_message(self, *args):
         pass
@@ -61,6 +64,10 @@ class FakeGemini(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         cls = type(self)
+        cls.post_calls += 1
+        error = cls.post_error(cls.post_calls)
+        if error:
+            return self._send(*error)
         if cls.daily_quota:
             return self._send(429, {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded",
                                               "details": [{"violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}]}})
@@ -79,6 +86,9 @@ class FakeGemini(BaseHTTPRequestHandler):
         interaction_id = path.rstrip("/").split("/")[-1]
         state = type(self).polls[interaction_id]
         state["count"] += 1
+        error = type(self).poll_error(state["index"], state["count"])
+        if error:
+            return self._send(*error)
         if state["count"] == 1:
             return self._send(200, {"id": interaction_id, "status": "in_progress"})
         status = type(self).final_status(state["index"])
@@ -169,9 +179,11 @@ class PipelineTest(unittest.TestCase):
         cls.server.shutdown()
 
     def setUp(self):
-        FakeGemini.requests, FakeGemini.polls = [], {}
+        FakeGemini.requests, FakeGemini.polls, FakeGemini.post_calls = [], {}, 0
         FakeGemini.reject_fps = FakeGemini.daily_quota = False
         FakeGemini.final_status = staticmethod(lambda index: "completed")
+        FakeGemini.post_error = staticmethod(lambda call_no: None)
+        FakeGemini.poll_error = staticmethod(lambda index, count: None)
         self.book = FakeSpreadsheet()
         self.videos = {}
         self.today = datetime.now(TAIPEI).date()
@@ -346,6 +358,45 @@ class PipelineTest(unittest.TestCase):
         FakeGemini.final_status = staticmethod(lambda index: "completed")
         self.assertEqual(self.run_main("--video-id", TODAY)[0], 0)
         self.assertEqual(self.rows()[-1][3], TODAY)
+
+    def test_transient_400_while_polling_is_retried_and_keeps_fps(self):
+        # 實際在 GitHub 上遇到的錯誤：輪詢結果時回傳 400，重新送出即成功，且不該因此停用 fps
+        self.set_channel(count=1)
+        invalid = (400, {"error": {"message": "Request contains an invalid argument.", "code": "invalid_request"}})
+        FakeGemini.poll_error = staticmethod(lambda index, count: invalid if index == 1 and count == 2 else None)
+        self.assertEqual(self.run_main("--video-id", TODAY)[0], 0)
+        processings = [r["input"][0]["content"][0]["processing"] for r in FakeGemini.requests]
+        self.assertEqual([p["end_offset"] for p in processings], ["1800s", "3600s", "3600s", "3995s"])
+        self.assertTrue(all(p.get("fps") == 0.2 for p in processings))
+        self.assertEqual(self.rows()[0][3], TODAY)
+
+    def test_failed_status_is_retried_within_the_run(self):
+        self.set_channel(count=1)
+        FakeGemini.final_status = staticmethod(lambda index: "failed" if index == 0 else "completed")
+        self.assertEqual(self.run_main("--video-id", TODAY)[0], 0)
+        self.assertEqual(len(FakeGemini.requests), 4)
+
+    def test_segment_gives_up_after_max_attempts(self):
+        self.set_channel(count=1)
+        FakeGemini.final_status = staticmethod(lambda index: "failed")
+        self.assertEqual(self.run_main("--video-id", TODAY)[0], 1)
+        self.assertEqual(len(FakeGemini.requests), transcriber.MAX_SEGMENT_ATTEMPTS)  # 第一段失敗就不再送後面的段落
+        self.assertIn("重試 3 次仍失敗", self.book.sheets["執行紀錄"].rows[-1][5])
+
+    def test_not_found_model_is_not_retried(self):
+        self.set_channel(count=1)
+        FakeGemini.post_error = staticmethod(lambda call_no: (404, {"error": {"message": "model not found", "code": "not_found"}}))
+        self.assertEqual(self.run_main("--video-id", TODAY)[0], 1)
+        self.assertEqual(FakeGemini.post_calls, 1)
+
+    def test_persistent_429_without_quota_details_counts_as_quota(self):
+        # 新版錯誤格式可能沒有 quotaId 等細節；持續 429 仍要判定為額度用完並停止
+        self.set_channel()
+        exhausted = (429, {"error": {"message": "Resource has been exhausted.", "code": "resource_exhausted"}})
+        FakeGemini.post_error = staticmethod(lambda call_no: exhausted)
+        self.assertEqual(self.run_main("--mode", "init")[0], 1)
+        self.assertEqual(self.log_results(), ["配額不足"])  # 只記一次，後面的影片不再嘗試
+        self.assertEqual(self.rows(), [])
 
     def test_daily_quota_stops_remaining_videos(self):
         self.set_channel()
