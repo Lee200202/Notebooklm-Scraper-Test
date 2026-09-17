@@ -5,6 +5,7 @@
   python main.py                     # daily：抓今天（台灣時間）那一集；試算表還沒資料時自動改做 init
   python main.py --mode init         # 抓頻道最新 5 場已結束直播中尚未寫入的
   python main.py --video-id XXXX     # 只處理指定影片
+  python main.py --mode daily --watch  # 排程用：等到 11:20，每 3 分鐘檢查一次，直到今天這集轉錄完成或 14:00
 
 「同一集每天最多失敗幾次」的限制只套用在排程觸發的執行；手動執行不受限制。
 
@@ -15,7 +16,9 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 import config
 from config import ConfigError
@@ -26,15 +29,27 @@ log = logging.getLogger("transcript")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
+def now_taipei() -> datetime:
+    return datetime.now(config.TAIPEI)
+
+
+def sleep(seconds: float) -> None:  # 包一層，測試時可以替換成假時鐘
+    time.sleep(seconds)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mode", choices=["check", "daily", "init"], default="daily")
     parser.add_argument("--video-id", default="", help="只處理這支影片")
     parser.add_argument("--force", action="store_true", help="影片已在試算表中也重新轉錄（會新增一列）")
+    parser.add_argument("--watch", action="store_true",
+                        help="排程用：等到 POLL_START，每 POLL_INTERVAL_MINUTES 分鐘檢查，直到今天這集完成或 POLL_END")
     args = parser.parse_args(argv)
     args.video_id = args.video_id.strip()
     if args.video_id and not VIDEO_ID_RE.match(args.video_id):
         parser.error(f"影片 ID 格式不正確：「{args.video_id}」（應為 11 碼，例如 r5YtdmBoMEA）")
+    if args.watch and (args.mode != "daily" or args.video_id):
+        parser.error("--watch 只能搭配 --mode daily 使用")
     return args
 
 
@@ -99,20 +114,75 @@ def run_check() -> int:
     return 0 if problems == 0 else 1
 
 
+@dataclass
+class Context:
+    cfg: config.Settings
+    youtube: YouTubeClient
+    store: object  # SheetStore
+    transcriber: object  # Transcriber
+    scheduled: bool
+
+
 def run_transcribe(args: argparse.Namespace) -> int:
-    from sheet_store import RESULT_FAILED, RESULT_OK, RESULT_QUOTA, SheetStore
-    from transcriber import QuotaExhausted, Transcriber
+    from sheet_store import SheetStore
+    from transcriber import Transcriber
 
     if os.getenv("GITHUB_EVENT_NAME") == "schedule" and len(config.missing_secrets()) == len(config.REQUIRED_SECRETS):
-        # 剛推上 GitHub、還沒設定金鑰時，不要每 5 分鐘寄一次失敗通知
+        # 剛推上 GitHub、還沒設定金鑰時，不要每次排程都寄失敗通知
         log.warning("尚未設定任何 GitHub Secrets，排程先略過（設定方式見 README）")
         return 0
 
     cfg = config.load_settings()
-    scheduled = os.getenv("GITHUB_EVENT_NAME") == "schedule"
-    now = datetime.now(config.TAIPEI)
-    youtube = YouTubeClient(cfg.youtube_api_key)
-    store = SheetStore(cfg.spreadsheet_id, config.parse_service_account(cfg.service_account_json))
+    ctx = Context(
+        cfg=cfg,
+        youtube=YouTubeClient(cfg.youtube_api_key),
+        store=SheetStore(cfg.spreadsheet_id, config.parse_service_account(cfg.service_account_json)),
+        transcriber=Transcriber(cfg.gemini_api_key, cfg.gemini_model, cfg.segment_minutes, cfg.video_fps,
+                                cfg.vocabulary, cfg.gemini_fallback_model),
+        scheduled=os.getenv("GITHUB_EVENT_NAME") == "schedule",
+    )
+    if args.watch:
+        return run_watch(ctx, args)
+    return process_once(ctx, args)[0]
+
+
+def run_watch(ctx: Context, args: argparse.Namespace) -> int:
+    """在同一次執行中反覆檢查：等到 POLL_START，每 POLL_INTERVAL_MINUTES 分鐘檢查一次，
+    直到今天這集轉錄完成（或失敗、或 YouTube 上根本沒有今天的直播），最晚到 POLL_END。
+
+    GitHub Actions 排程最短間隔是 5 分鐘，而且可能延遲，所以排程提早幾分鐘啟動，由這裡精準控制時間。
+    """
+    cfg = ctx.cfg
+    now = now_taipei()
+    start = datetime.combine(now.date(), cfg.poll_start, tzinfo=config.TAIPEI)
+    end = datetime.combine(now.date(), cfg.poll_end, tzinfo=config.TAIPEI)
+    interval = timedelta(minutes=cfg.poll_interval_minutes)
+    if now < start:
+        log.info("等到 %s 開始檢查（之後每 %d 分鐘一次，最晚到 %s）",
+                 f"{start:%H:%M}", cfg.poll_interval_minutes, f"{end:%H:%M}")
+        sleep((start - now).total_seconds())
+
+    checks = 0
+    while True:
+        checks += 1
+        code, waiting = process_once(ctx, args)
+        if not waiting:
+            return code
+        next_check = now_taipei() + interval
+        if next_check > end:
+            log.info("已接近 %s，停止等待（共檢查 %d 次），之後的排程會再檢查", f"{end:%H:%M}", checks)
+            return code
+        log.info("第 %d 次檢查：今天的直播還沒準備好，%s 再檢查", checks, f"{next_check:%H:%M}")
+        sleep(interval.total_seconds())
+
+
+def process_once(ctx: Context, args: argparse.Namespace) -> tuple[int, bool]:
+    """檢查並轉錄一次。回傳 (結束代碼, 是否在等待今天的直播準備好)。"""
+    from sheet_store import RESULT_FAILED, RESULT_OK, RESULT_QUOTA
+    from transcriber import QuotaExhausted
+
+    cfg, youtube, store, transcriber = ctx.cfg, ctx.youtube, ctx.store, ctx.transcriber
+    now = now_taipei()
     done = store.existing_video_ids()
     mode = args.mode
 
@@ -121,7 +191,7 @@ def run_transcribe(args: argparse.Namespace) -> int:
         targets = youtube.get_streams([args.video_id])
         if not targets:
             log.error("找不到直播影片 %s（影片不存在、已被刪除，或不是直播影片）", args.video_id)
-            return 1
+            return 1, False
     else:
         streams = youtube.recent_streams(cfg.channel_id, cfg.title_keyword)
         if mode == "daily" and not done:
@@ -134,8 +204,8 @@ def run_transcribe(args: argparse.Namespace) -> int:
         else:
             targets = [s for s in streams if s.episode_date == now.date()]
             if not targets:
-                log.info("YouTube 上還沒有今天（%s）的直播，下次排程再查", now.date())
-                return 0
+                log.info("YouTube 上沒有今天（%s）的直播（可能休市），之後的排程會再查", now.date())
+                return 0, False
 
     if not args.force:
         for s in targets:
@@ -143,19 +213,17 @@ def run_transcribe(args: argparse.Namespace) -> int:
                 log.info("%s %s 已經在試算表中，略過", s.episode_date, s.video_id)
         targets = [s for s in targets if s.video_id not in done]
 
-    transcriber = Transcriber(cfg.gemini_api_key, cfg.gemini_model, cfg.segment_minutes, cfg.video_fps, cfg.vocabulary,
-                              cfg.gemini_fallback_model)
-    had_error = False
+    had_error = waiting = False
     for stream in targets:
         if not stream.is_ready(now, cfg.ready_delay_minutes):
-            log.info("%s %s：%s，下次排程再查", stream.episode_date, stream.video_id,
-                     stream.status_text(now, cfg.ready_delay_minutes))
+            log.info("%s %s：%s", stream.episode_date, stream.video_id, stream.status_text(now, cfg.ready_delay_minutes))
+            waiting = waiting or mode == "daily"
             continue
         attempts = store.failed_attempts_today(stream.video_id)
-        # 次數限制只用在「排程」：避免每 5 分鐘自動重試浪費額度、寄一堆失敗通知信。
+        # 次數限制只用在「排程」：避免自動重試浪費額度、寄一堆失敗通知信。
         # 在 Actions 頁面手動按「Run workflow」是刻意要重試，不受限制。
-        if scheduled and attempts >= cfg.max_attempts_per_day:
-            # 不回傳錯誤碼，避免之後每 5 分鐘都寄一次失敗通知信
+        if ctx.scheduled and attempts >= cfg.max_attempts_per_day:
+            # 不回傳錯誤碼，避免之後每次排程都寄一次失敗通知信
             log.warning("%s %s 今天已失敗 %d 次，暫停重試（請查看「執行紀錄」工作表）",
                         stream.episode_date, stream.video_id, attempts)
             continue
@@ -180,7 +248,7 @@ def run_transcribe(args: argparse.Namespace) -> int:
         log.info("完成：%s，共 %d 字（模型 %s），已寫入試算表", stream.title, chars, models)
         store.log(mode, stream, RESULT_OK, f"{chars} 字，模型 {models}")
 
-    return 1 if had_error else 0
+    return (1 if had_error else 0), waiting and not had_error
 
 
 def setup_logging() -> None:

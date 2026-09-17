@@ -8,7 +8,7 @@ import binascii
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import timedelta, timezone
+from datetime import time, timedelta, timezone
 
 # 台灣沒有日光節約時間，固定 UTC+8
 TAIPEI = timezone(timedelta(hours=8))
@@ -63,6 +63,15 @@ def _number(name: str, default, cast, minimum):
     if value < minimum:
         raise ConfigError(f"{name} 不能小於 {minimum}，目前是 {value}")
     return value
+
+
+def _clock(name: str, default: str) -> time:
+    raw = env(name, default)
+    try:
+        hour, minute = (int(x) for x in raw.split(":"))
+        return time(hour, minute)
+    except ValueError:
+        raise ConfigError(f"{name} 必須是 HH:MM 格式（例如 11:20），目前是「{raw}」") from None
 
 
 def _fallback_model() -> str:
@@ -121,6 +130,9 @@ class Settings:
     title_keyword: str
     init_video_count: int
     ready_delay_minutes: int
+    poll_start: time  # 排程從幾點開始檢查（台灣時間）
+    poll_end: time  # 最晚檢查到幾點
+    poll_interval_minutes: int
 
     gemini_api_key: str = field(repr=False)
     gemini_model: str
@@ -139,6 +151,8 @@ def load_settings(strict: bool = True) -> Settings:
     missing = missing_secrets()
     if strict and missing:
         raise ConfigError(f"缺少 GitHub Secrets：{', '.join(missing)}")
+    if _clock("POLL_START", "11:20") >= _clock("POLL_END", "14:00"):
+        raise ConfigError("POLL_START 必須早於 POLL_END")
     return Settings(
         youtube_api_key=env("YOUTUBE_API_KEY"),
         # @xinchenginsta（張震_股市盤中家教班）的頻道 ID
@@ -147,6 +161,10 @@ def load_settings(strict: bool = True) -> Settings:
         init_video_count=_number("INIT_VIDEO_COUNT", 5, int, 1),
         # 直播結束後至少等幾分鐘才開始轉錄，讓 YouTube 處理完回放
         ready_delay_minutes=_number("READY_DELAY_MINUTES", 5, int, 0),
+        # GitHub 排程最短只能每 5 分鐘一次，所以由程式自己在同一次執行中每 N 分鐘檢查
+        poll_start=_clock("POLL_START", "11:20"),
+        poll_end=_clock("POLL_END", "14:00"),
+        poll_interval_minutes=_number("POLL_INTERVAL_MINUTES", 3, int, 1),
         gemini_api_key=env("GEMINI_API_KEY"),
         gemini_model=env("GEMINI_MODEL", "gemini-3.8-flash"),
         # 主要模型額度用完時改用的模型。額度按模型分開計算，flash-lite 免費額度較多、也比較便宜。

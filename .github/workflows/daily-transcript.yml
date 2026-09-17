@@ -2,11 +2,16 @@ name: 每日直播逐字稿
 
 on:
   schedule:
-    # 台灣時間 週一～週五 11:20～11:55，每 5 分鐘檢查一次（20/5 = 從第 20 分開始每 5 分鐘）
-    - cron: "20/5 11 * * 1-5"
+    # 【主要】台灣時間 週一～週五 11:10 啟動。GitHub 排程最短只能每 5 分鐘一次、而且常延遲，
+    # 所以提早 10 分鐘啟動，由程式（--watch）等到 11:20 開始，每 3 分鐘檢查一次，
+    # 直到今天這集轉錄完成，最晚到 14:00。時間可用 Variables 的 POLL_START／POLL_END／POLL_INTERVAL_MINUTES 調整
+    - cron: "10 11 * * 1-5"
       timezone: "Asia/Taipei"
-    # 台灣時間 週一～週五 12:00～13:55，直播延長或 YouTube 處理較慢時的緩衝
-    - cron: "*/5 12-13 * * 1-5"
+    # 【備援】萬一 11:10 那次被 GitHub 延遲太久或略過。主要那次還在執行時，這些會排隊，
+    # 輪到時發現已完成就立刻結束（排隊中被取代的會顯示為 Cancelled，屬正常）
+    - cron: "30,50 11 * * 1-5"
+      timezone: "Asia/Taipei"
+    - cron: "10,30,50 12-13 * * 1-5"
       timezone: "Asia/Taipei"
     # 台灣時間 週一～週五 15:10、15:40、16:10、16:40：Gemini 每日額度在太平洋時間午夜重置
     # （台灣 15:00，美國冬令時間期間為 16:00），萬一早上因額度不足失敗，重置後再補一次
@@ -37,7 +42,7 @@ concurrency:
 jobs:
   transcript:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240  # 11:10 啟動、最晚等到 14:00，再加上轉錄時間
     steps:
       - uses: actions/checkout@v7
 
@@ -63,6 +68,9 @@ jobs:
           VIDEO_FPS: ${{ vars.VIDEO_FPS }}
           INIT_VIDEO_COUNT: ${{ vars.INIT_VIDEO_COUNT }}
           READY_DELAY_MINUTES: ${{ vars.READY_DELAY_MINUTES }}
+          POLL_START: ${{ vars.POLL_START }}
+          POLL_END: ${{ vars.POLL_END }}
+          POLL_INTERVAL_MINUTES: ${{ vars.POLL_INTERVAL_MINUTES }}
           MAX_ATTEMPTS_PER_DAY: ${{ vars.MAX_ATTEMPTS_PER_DAY }}
           CUSTOM_VOCABULARY: ${{ vars.CUSTOM_VOCABULARY }}
           # ---- 手動執行的輸入值；排程觸發時為空，所以預設 daily ----
@@ -72,6 +80,8 @@ jobs:
         run: |
           if [ -n "$VIDEO_ID" ]; then
             python main.py --video-id "$VIDEO_ID"
+          elif [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            python main.py --mode daily --watch
           else
             python main.py --mode "$MODE"
           fi

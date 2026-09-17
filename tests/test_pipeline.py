@@ -11,7 +11,7 @@ import sys
 import threading
 import unittest
 from contextlib import redirect_stdout
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -149,11 +149,11 @@ def iso(dt):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def make_video(video_id, day, duration, live="none", ended_minutes_ago=300):
+def make_video(video_id, day, duration, live="none", ended_minutes_ago=300, ended_at=None):
     start = datetime(day.year, day.month, day.day, 10, 5, tzinfo=TAIPEI)
     details = {"actualStartTime": iso(start), "scheduledStartTime": iso(start)}
     if live == "none":
-        details["actualEndTime"] = iso(datetime.now(TAIPEI) - timedelta(minutes=ended_minutes_ago))
+        details["actualEndTime"] = iso(ended_at or datetime.now(TAIPEI) - timedelta(minutes=ended_minutes_ago))
     weekday = "一二三四五六日"[day.weekday()]
     return {
         "id": video_id,
@@ -343,7 +343,7 @@ class PipelineTest(unittest.TestCase):
         self.run_main("--mode", "init")
         code, output = self.run_main()
         self.assertEqual(code, 0)
-        self.assertIn("還沒有今天", output)
+        self.assertIn("沒有今天", output)
 
     def test_truncated_segment_is_split_in_half(self):
         self.set_channel(count=1)
@@ -501,6 +501,77 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("尚未設定任何 GitHub Secrets", output)
         with mock.patch.dict(os.environ, {**blank, "GITHUB_EVENT_NAME": "workflow_dispatch"}):
             self.assertEqual(self.run_main("--mode", "init")[0], 1)  # 手動執行仍要明確報錯
+
+    # -- --watch：排程在同一次執行中每 3 分鐘檢查 ----------------------------------
+    def fake_clock(self, hour, minute, on_sleep=None):
+        """把 main 的時鐘換成假的：sleep 只推進時間，並可在每次 sleep 時改變影片狀態。"""
+        clock = {"now": datetime.combine(self.today, time(hour, minute), tzinfo=TAIPEI), "sleeps": []}
+
+        def fake_sleep(seconds):
+            clock["sleeps"].append(seconds)
+            clock["now"] += timedelta(seconds=seconds)
+            if on_sleep:
+                on_sleep(clock["now"])
+
+        for p in (mock.patch.object(main, "now_taipei", lambda: clock["now"]),
+                  mock.patch.object(main, "sleep", fake_sleep),
+                  mock.patch.dict(os.environ, {"GITHUB_EVENT_NAME": "schedule"})):
+            p.start()
+            self.addCleanup(p.stop)
+        return clock
+
+    def test_watch_waits_until_1120_then_checks_every_3_minutes(self):
+        self.set_channel(count=2, live="live")
+        self.run_main("--mode", "init")  # 先寫入舊的那集，試算表才不是空的
+        before = len(FakeGemini.requests)
+
+        def stream_finishes(now):
+            if now >= datetime.combine(self.today, time(11, 26), tzinfo=TAIPEI):  # 11:15 結束，11:20 起可轉錄
+                self.videos[TODAY] = make_video(TODAY, self.today, 3995,
+                                                ended_at=datetime.combine(self.today, time(11, 15), tzinfo=TAIPEI))
+
+        clock = self.fake_clock(11, 10, stream_finishes)
+        code, output = self.run_main("--mode", "daily", "--watch")
+        self.assertEqual(code, 0)
+        # 11:10 啟動 → 等 10 分鐘到 11:20 → 11:20、11:23 還在直播 → 11:26 可轉錄
+        self.assertEqual(clock["sleeps"], [600, 180, 180])
+        self.assertIn("等到 11:20 開始檢查", output)
+        self.assertIn("第 2 次檢查：今天的直播還沒準備好，11:26 再檢查", output)
+        self.assertEqual(len(FakeGemini.requests), before + 3)
+        self.assertEqual(self.rows()[-1][3], TODAY)
+
+    def test_watch_started_late_checks_immediately_and_exits_when_done(self):
+        self.set_channel(count=2)
+        self.run_main("--mode", "init")  # 兩集都已寫入
+        clock = self.fake_clock(11, 50)
+        code, output = self.run_main("--mode", "daily", "--watch")
+        self.assertEqual((code, clock["sleeps"]), (0, []))
+        self.assertIn("已經在試算表中", output)
+
+    def test_watch_gives_up_at_poll_end(self):
+        self.set_channel(count=2, live="live")
+        self.run_main("--mode", "init")
+        clock = self.fake_clock(13, 50)
+        code, output = self.run_main("--mode", "daily", "--watch")
+        self.assertEqual(code, 0)
+        self.assertEqual(clock["sleeps"], [180, 180, 180])  # 13:50、13:53、13:56、13:59 共 4 次；再下一次 14:02 超過 14:00
+        self.assertIn("停止等待（共檢查 4 次）", output)
+
+    def test_watch_without_stream_today_exits_after_one_check(self):
+        self.set_channel(count=2)
+        del self.videos[TODAY]
+        self.run_main("--mode", "init")
+        clock = self.fake_clock(11, 20)
+        code, _ = self.run_main("--mode", "daily", "--watch")
+        self.assertEqual((code, clock["sleeps"]), (0, []))  # 休市日不空等，交給之後的備援排程
+
+    def test_watch_options_are_validated(self):
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()):
+            main.parse_args(["--mode", "init", "--watch"])
+        with mock.patch.dict(os.environ, {"POLL_START": "11:70"}), self.assertRaises(ConfigError):
+            config.load_settings()
+        with mock.patch.dict(os.environ, {"POLL_START": "15:00", "POLL_END": "14:00"}), self.assertRaises(ConfigError):
+            config.load_settings()
 
     def test_invalid_video_id_is_rejected(self):
         with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
