@@ -66,16 +66,32 @@ def _is_daily_quota(message: str) -> bool:
 
 
 class Transcriber:
-    def __init__(self, api_key: str, model: str, segment_minutes: int, video_fps: float, vocabulary: tuple[str, ...],
-                 fallback_model: str = ""):
-        self.client = genai.Client(api_key=api_key)
+    def __init__(self, api_key: str | tuple[str, ...] | list[str], model: str, segment_minutes: int, video_fps: float,
+                 vocabulary: tuple[str, ...], fallback_model: str = "",
+                 api_keys: tuple[str, ...] | list[str] | None = None):
+        if isinstance(api_key, (list, tuple)):
+            raw_keys = list(api_key)
+        elif api_keys:
+            raw_keys = list(api_keys)
+        elif api_key:
+            raw_keys = [api_key]
+        else:
+            raw_keys = []
+        self.api_keys = [k for k in raw_keys if k] or [""]
+        self.clients = [genai.Client(api_key=k) for k in self.api_keys]
+        self.key_index = 0
         # 額度是「每個模型分開計算」：主要模型額度用完時，改用備援模型繼續
         self.models = [model] + ([fallback_model] if fallback_model and fallback_model != model else [])
         self.model_index = 0
         self.models_used: list[str] = []  # 目前這集實際用到的模型（寫入試算表「模型」欄）
+        self.keys_used: list[int] = []    # 目前這集實際用到的金鑰編號（1-based）
         self.segment_seconds = segment_minutes * 60
         self.video_fps = video_fps
         self.vocabulary = vocabulary
+
+    @property
+    def client(self) -> genai.Client:
+        return self.clients[self.key_index]
 
     @property
     def model(self) -> str:
@@ -91,6 +107,7 @@ class Transcriber:
 
     def transcribe(self, video_url: str, duration_sec: int) -> str:
         self.models_used = []
+        self.keys_used = []
         sections = []
         for start in range(0, duration_sec, self.segment_seconds):
             end = min(start + self.segment_seconds, duration_sec)
@@ -104,12 +121,31 @@ class Transcriber:
                 text, complete = self._request(video_url, start, end)
                 break
             except QuotaExhausted as exc:
-                if self.model_index + 1 >= len(self.models):
-                    raise
-                log.warning("  %s 額度用完（%s），改用備援模型 %s 繼續", self.model, exc, self.models[self.model_index + 1])
-                self.model_index += 1  # 這次執行後面的片段、影片都用備援模型
+                # 1. 若還有下一組 API Key，馬上切換（維持高品質主要模型）
+                if self.key_index + 1 < len(self.api_keys):
+                    old_idx = self.key_index
+                    self.key_index += 1
+                    log.warning("  API 金鑰 #%d 額度用完（%s），馬上切換到 API 金鑰 #%d 繼續（模型 %s）",
+                                old_idx + 1, exc, self.key_index + 1, self.model)
+                    continue
+                # 2. 所有 API Key 在目前模型的額度都用完，改用備援模型，並切換回第 1 組金鑰
+                if self.model_index + 1 < len(self.models):
+                    old_model = self.model
+                    self.model_index += 1
+                    self.key_index = 0
+                    if len(self.api_keys) > 1:
+                        log.warning("  所有 API 金鑰在 %s 的額度均已用完（%s），改用備援模型 %s 並切換回 API 金鑰 #1 繼續",
+                                    old_model, exc, self.model)
+                    else:
+                        log.warning("  %s 額度用完（%s），改用備援模型 %s 繼續", old_model, exc, self.model)
+                    continue
+                # 3. 所有金鑰與所有模型額度皆耗盡
+                raise
         if self.model not in self.models_used:
             self.models_used.append(self.model)
+        key_num = self.key_index + 1
+        if key_num not in self.keys_used:
+            self.keys_used.append(key_num)
         if complete:
             return text
         if end - start < MIN_SPLIT_SECONDS * 2:
@@ -145,8 +181,9 @@ class Transcriber:
             processing = {"type": "static", "start_offset": f"{start}s", "end_offset": f"{end}s"}
             if use_fps:
                 processing["fps"] = self.video_fps
-            log.info("  Gemini 轉錄 %s–%s（第 %d 次%s）", _hms(start), _hms(end), attempt,
-                     f"，fps={self.video_fps}" if use_fps else "")
+            key_tag = f"，金鑰 #{self.key_index + 1}" if len(self.api_keys) > 1 else ""
+            log.info("  Gemini 轉錄 %s–%s（第 %d 次%s%s）", _hms(start), _hms(end), attempt,
+                     f"，fps={self.video_fps}" if use_fps else "", key_tag)
 
             stage = "送出請求"
             try:
@@ -165,12 +202,13 @@ class Transcriber:
                 interaction = self._wait(interaction)
             except Exception as exc:
                 status, message = _error_details(exc)
-                if status in NON_RETRYABLE_STATUS:
+                is_quota_403 = status == 403 and any(k in message.lower() for k in ("quota", "exhausted", "ratelimit", "rate_limit"))
+                if status in NON_RETRYABLE_STATUS and not is_quota_403:
                     raise
-                if status == 429:
+                if status == 429 or is_quota_403:
                     # 完整印出是哪一種額度（每日請求數、每分鐘 token 數…），方便判斷
                     detail = _quota_summary(message) or message[:300]
-                    if _is_daily_quota(message):
+                    if _is_daily_quota(message) or is_quota_403:
                         raise QuotaExhausted(f"每日額度已用完：{detail}") from exc
                 else:
                     detail = message[:300]
@@ -193,7 +231,7 @@ class Transcriber:
             if status == "incomplete":
                 return text, False
             if status == "budget_exceeded":
-                raise RuntimeError("已達 Gemini 帳單的支出上限，請到 AI Studio 調整上限")
+                raise QuotaExhausted("已達 Gemini 帳單的支出上限，請到 AI Studio 調整上限")
             last_error = (
                 "Gemini 回傳空白逐字稿" if status == "completed"
                 else f"Gemini 回傳狀態 {status}：{getattr(interaction, 'errors', None)}"

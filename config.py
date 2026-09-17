@@ -7,6 +7,7 @@ import base64
 import binascii
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import time, timedelta, timezone
 
@@ -79,8 +80,49 @@ def _fallback_model() -> str:
     return "" if value.lower() in ("none", "off", "false", "0", "-") else value
 
 
+def _parse_keys(primary_name: str, plural_name: str, prefix: str) -> tuple[str, ...]:
+    """讀取多組 API Key：
+    1. 支援複數名稱，例如 GEMINI_API_KEYS（可用逗號、分號、換行或空白分隔）
+    2. 支援主要名稱，例如 GEMINI_API_KEY（若填入多組亦可自動解析）
+    3. 支援編號名稱，例如 GEMINI_API_KEY_1, GEMINI_API_KEY_2, GEMINI_API_KEY_3...
+    去重並保持順序。
+    """
+    keys: list[str] = []
+    plural_val = env(plural_name)
+    if plural_val:
+        for k in re.split(r"[\r\n,;\s]+", plural_val):
+            if k.strip():
+                keys.append(k.strip())
+    primary_val = env(primary_name)
+    if primary_val:
+        for k in re.split(r"[\r\n,;\s]+", primary_val):
+            if k.strip():
+                keys.append(k.strip())
+    for i in range(1, 21):
+        num_val = env(f"{prefix}_{i}")
+        if num_val:
+            for k in re.split(r"[\r\n,;\s]+", num_val):
+                if k.strip():
+                    keys.append(k.strip())
+    seen = set()
+    unique = []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            unique.append(k)
+    return tuple(unique)
+
+
 def missing_secrets() -> list[str]:
-    return [name for name in REQUIRED_SECRETS if not env(name)]
+    missing = []
+    if not _parse_keys("GEMINI_API_KEY", "GEMINI_API_KEYS", "GEMINI_API_KEY"):
+        missing.append("GEMINI_API_KEY")
+    if not _parse_keys("YOUTUBE_API_KEY", "YOUTUBE_API_KEYS", "YOUTUBE_API_KEY"):
+        missing.append("YOUTUBE_API_KEY")
+    for name in ("SPREADSHEET_ID", "GOOGLE_SERVICE_ACCOUNT_JSON"):
+        if not env(name):
+            missing.append(name)
+    return missing
 
 
 def parse_service_account(raw: str) -> dict:
@@ -152,6 +194,9 @@ class Settings:
     smtp_host: str
     smtp_port: int
 
+    gemini_api_keys: tuple[str, ...] = field(default=(), repr=False)
+    youtube_api_keys: tuple[str, ...] = field(default=(), repr=False)
+
 
 def load_settings(strict: bool = True) -> Settings:
     """strict=False 時允許 Secrets 缺漏（給 --mode check 逐項檢查用）。"""
@@ -163,8 +208,13 @@ def load_settings(strict: bool = True) -> Settings:
     mail_username, mail_password = env("MAIL_USERNAME"), env("MAIL_APP_PASSWORD")
     if strict and bool(mail_username) != bool(mail_password):
         raise ConfigError("MAIL_USERNAME 和 MAIL_APP_PASSWORD 要一起設定（或都不設定＝不寄信）")
+
+    gemini_keys = _parse_keys("GEMINI_API_KEY", "GEMINI_API_KEYS", "GEMINI_API_KEY")
+    youtube_keys = _parse_keys("YOUTUBE_API_KEY", "YOUTUBE_API_KEYS", "YOUTUBE_API_KEY")
+    mask_in_actions(*gemini_keys, *youtube_keys)
+
     return Settings(
-        youtube_api_key=env("YOUTUBE_API_KEY"),
+        youtube_api_key=youtube_keys[0] if youtube_keys else env("YOUTUBE_API_KEY"),
         # @xinchenginsta（張震_股市盤中家教班）的頻道 ID
         channel_id=env("YOUTUBE_CHANNEL_ID", "UCPqyYS3n6yyXL2jygauXpzg"),
         title_keyword=env("TITLE_KEYWORD", "股市盤中家教班"),
@@ -175,7 +225,7 @@ def load_settings(strict: bool = True) -> Settings:
         poll_start=_clock("POLL_START", "11:20"),
         poll_end=_clock("POLL_END", "14:00"),
         poll_interval_minutes=_number("POLL_INTERVAL_MINUTES", 3, int, 1),
-        gemini_api_key=env("GEMINI_API_KEY"),
+        gemini_api_key=gemini_keys[0] if gemini_keys else env("GEMINI_API_KEY"),
         gemini_model=env("GEMINI_MODEL", "gemini-3.8-flash"),
         # 主要模型額度用完時改用的模型。額度按模型分開計算，flash-lite 免費額度較多、也比較便宜。
         # 設成 none 可停用備援
@@ -195,4 +245,6 @@ def load_settings(strict: bool = True) -> Settings:
         mail_to=tuple(a.strip() for a in env("MAIL_TO", mail_username).split(",") if a.strip()),
         smtp_host=env("SMTP_HOST", "smtp.gmail.com"),
         smtp_port=_number("SMTP_PORT", 465, int, 1),
+        gemini_api_keys=gemini_keys,
+        youtube_api_keys=youtube_keys,
     )

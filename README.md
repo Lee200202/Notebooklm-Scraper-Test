@@ -120,17 +120,29 @@ bash setup.sh
 
 程式第一次執行時，會自動建立「逐字稿」和「執行紀錄」兩個工作表。原本的「工作表1」可以刪掉。
 
-### 步驟 4：在 GitHub 設定 4 個 Secrets
+### 步驟 4：在 GitHub 設定 Secrets（支援多組 API 金鑰自動輪替）
 
 開啟 <https://github.com/Lee200202/Notebooklm-Scraper-Test/settings/secrets/actions>，
 按「New repository secret」，逐一新增（Name 要完全一樣）：
 
-| Name | Secret |
-|---|---|
-| `GEMINI_API_KEY` | 步驟 1 的金鑰 |
-| `YOUTUBE_API_KEY` | 步驟 2 的 ① |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | 步驟 2 的 ③ |
-| `SPREADSHEET_ID` | 步驟 3 的試算表 ID |
+| Name | 說明 | 必填／選填 |
+|---|---|---|
+| `GEMINI_API_KEY` | 主要 Gemini API 金鑰（步驟 1 取得） | **必填** |
+| `GEMINI_API_KEY_2` | 第 2 組 Gemini API 金鑰（額度用完時**馬上無縫接軌切換**） | 選填（推薦設定） |
+| `GEMINI_API_KEY_3` | 第 3 組 Gemini API 金鑰（支援到 `GEMINI_API_KEY_5` 或更多） | 選填 |
+| `YOUTUBE_API_KEY` | YouTube Data API 金鑰（步驟 2 的 ①） | **必填** |
+| `YOUTUBE_API_KEY_2` | 第 2 組 YouTube 金鑰（遇配額上限時自動切換） | 選填 |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | 步驟 2 的 ③（服務帳戶金鑰完整內容） | **必填** |
+| `SPREADSHEET_ID` | 步驟 3 的 Google 試算表 ID | **必填** |
+
+> 💡 **如何取得獨立額度的多組 Gemini API Key？**
+> 1. 在 [Google AI Studio](https://aistudio.google.com/apikey) 按「Create API key」時，請選擇 **「Create API key in new project」**（在不同 GCP 專案中建立），或是使用不同的個人 Google / Gmail 帳號建立金鑰。
+> 2. **重要提醒**：若多組金鑰建在同一個 Google Cloud 專案內，其每日額度是共用的；建在**不同專案**或**不同 Google 帳號**下，每組金鑰才能享有獨立完整的免費額度！
+>
+> 🔄 **自動切換機制說明**：
+> - 轉錄進行中，若第 1 組金鑰遇到每日配額用盡（429 Resource Exhausted）或帳單上限，系統會**立刻自動切換到第 2 組金鑰**，並維持高品質的 `gemini-3.8-flash` 主要模型繼續轉錄，不會中斷。
+> - 只有當**所有** API 金鑰在主要模型的額度都耗盡時，才會切換至備援模型（`gemini-3.5-flash-lite`），並自動循環回到第 1 組金鑰繼續處理。
+> - 你也可以將多組金鑰以半形逗號分隔直接填在 `GEMINI_API_KEY`，或設定為 `GEMINI_API_KEYS`，程式皆能智慧解析。
 
 ### 步驟 4-2：設定寄信通知（選填，建議）
 

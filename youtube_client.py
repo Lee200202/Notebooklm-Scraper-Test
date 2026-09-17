@@ -72,16 +72,30 @@ def _parse_time(value: str | None) -> datetime | None:
 
 
 class YouTubeClient:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
+    def __init__(self, api_key: str | tuple[str, ...] | list[str]):
+        if isinstance(api_key, (list, tuple)):
+            self.api_keys = [k for k in api_key if k]
+        elif api_key:
+            self.api_keys = [api_key]
+        else:
+            self.api_keys = []
+        self.key_index = 0
         self.session = requests.Session()
 
+    @property
+    def api_key(self) -> str:
+        return self.api_keys[self.key_index] if self.api_keys else ""
+
     def _get(self, endpoint: str, **params) -> dict:
-        params["key"] = self.api_key
-        resp = self.session.get(f"{API_BASE}/{endpoint}", params=params, timeout=30)
-        if resp.status_code != 200:
+        while True:
+            params["key"] = self.api_key
+            resp = self.session.get(f"{API_BASE}/{endpoint}", params=params, timeout=30)
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code in (403, 429) and self.key_index + 1 < len(self.api_keys):
+                self.key_index += 1
+                continue
             raise RuntimeError(f"YouTube API {endpoint} 失敗（HTTP {resp.status_code}）：{resp.text[:500]}")
-        return resp.json()
 
     def recent_streams(self, channel_id: str, title_keyword: str, limit: int = 15) -> list[Stream]:
         """頻道最近的直播場次，新到舊排序。"""

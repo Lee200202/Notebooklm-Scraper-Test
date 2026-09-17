@@ -29,6 +29,8 @@ import transcriber  # noqa: E402
 import youtube_client  # noqa: E402
 from config import TAIPEI, ConfigError  # noqa: E402
 
+REAL_YOUTUBE_GET = youtube_client.YouTubeClient._get
+
 MODEL = "gemini-3.8-flash"
 FALLBACK = "gemini-3.5-flash-lite"
 TODAY = "todayVideo1"  # YouTube 影片 ID 固定 11 碼
@@ -66,6 +68,7 @@ class FakeGemini(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        body["_api_key"] = self.headers.get("x-goog-api-key")
         cls = type(self)
         cls.post_calls += 1
         error = cls.post_error(cls.post_calls, body)
@@ -496,6 +499,72 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(self.log_results(), ["配額不足"])
         self.assertEqual(self.rows(), [])
+
+    def test_multi_key_config_parsing(self):
+        with mock.patch.dict(os.environ, {
+            "GEMINI_API_KEY": "k1, k2",
+            "GEMINI_API_KEY_2": "k2",
+            "GEMINI_API_KEY_3": "k3",
+            "GEMINI_API_KEYS": "k0, k1",
+        }):
+            keys = config._parse_keys("GEMINI_API_KEY", "GEMINI_API_KEYS", "GEMINI_API_KEY")
+            self.assertEqual(keys, ("k0", "k1", "k2", "k3"))
+
+    def test_multi_gemini_api_keys_rotation_on_quota(self):
+        # 2 組 API 金鑰：第 1 組額度用完時，馬上換第 2 組繼續（維持高品質主要模型，不降級）
+        self.set_channel(count=1)
+        # 第一段請求用 key1 成功；第二段請求時 key1 收到 429 額度用盡，key2 接手成功
+        FakeGemini.post_error = staticmethod(
+            lambda call_no, body: QUOTA_EXCEEDED if body.get("_api_key") == "key-1" and call_no > 1 else None
+        )
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "key-1", "GEMINI_API_KEY_2": "key-2"}), \
+                self.assertLogs("transcriber", level="WARNING") as transcriber_logs:
+            code, _ = self.run_main("--video-id", TODAY)
+        self.assertEqual(code, 0)
+        self.assertEqual([r["model"] for r in FakeGemini.requests], [MODEL] * 3)  # 全程都是主要模型
+        self.assertEqual(self.rows()[0][9], MODEL)  # 「模型」欄位仍是主要模型
+        warnings = " | ".join(transcriber_logs.output)
+        self.assertIn("API 金鑰 #1 額度用完", warnings)
+        self.assertIn("馬上切換到 API 金鑰 #2 繼續", warnings)
+        # 驗證被接受的請求中包含 key-1 與 key-2
+        api_keys_used = [r.get("_api_key") for r in FakeGemini.requests]
+        self.assertEqual(api_keys_used, ["key-1", "key-2", "key-2"])
+
+    def test_all_keys_exhausted_switches_to_fallback_model(self):
+        # 所有金鑰在主要模型都耗盡額度時，才切換到備援模型，且重設金鑰從第 1 組開始嘗試
+        self.set_channel(count=1)
+        FakeGemini.post_error = staticmethod(
+            lambda call_no, body: QUOTA_EXCEEDED if body["model"] == MODEL else None
+        )
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "key-1", "GEMINI_API_KEY_2": "key-2"}), \
+                self.assertLogs("transcriber", level="WARNING") as transcriber_logs:
+            code, _ = self.run_main("--video-id", TODAY)
+        self.assertEqual(code, 0)
+        self.assertEqual([r["model"] for r in FakeGemini.requests], [FALLBACK] * 3)
+        warnings = " | ".join(transcriber_logs.output)
+        self.assertIn("所有 API 金鑰在 gemini-3.8-flash 的額度均已用完", warnings)
+        self.assertIn("改用備援模型 gemini-3.5-flash-lite", warnings)
+
+    def test_youtube_client_multi_key_rotation(self):
+        # 模擬 YouTubeClient 在第 1 組金鑰遇到 403 quotaExceeded 時自動切換到第 2 組
+        calls = []
+
+        def fake_get(url, params=None, timeout=None):
+            calls.append(params.get("key"))
+            resp = mock.MagicMock()
+            if params.get("key") == "yt-1":
+                resp.status_code = 403
+                resp.text = "quotaExceeded"
+            else:
+                resp.status_code = 200
+                resp.json.return_value = {"items": [{"contentDetails": {"relatedPlaylists": {"uploads": "U123"}}}]}
+            return resp
+
+        yt = youtube_client.YouTubeClient(["yt-1", "yt-2"])
+        with mock.patch.object(yt.session, "get", fake_get):
+            data = REAL_YOUTUBE_GET(yt, "channels", id="test")
+        self.assertEqual(data["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"], "U123")
+        self.assertEqual(calls, ["yt-1", "yt-2"])
 
     def test_long_transcript_is_split_across_cells(self):
         store = sheet_store.SheetStore("sheet-id", SERVICE_ACCOUNT)

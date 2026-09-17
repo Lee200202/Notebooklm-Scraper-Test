@@ -86,13 +86,20 @@ def run_check() -> int:
     if missing:
         fail(f"缺少 GitHub Secrets：{', '.join(missing)}")
     else:
-        ok("4 個 GitHub Secrets 都已設定")
+        gemini_count = len(cfg.gemini_api_keys)
+        if gemini_count > 1:
+            ok(f"4 個 GitHub Secrets 都已設定（包含 {gemini_count} 組 Gemini API 金鑰）")
+        else:
+            ok("4 個 GitHub Secrets 都已設定")
 
     now = datetime.now(config.TAIPEI)
-    if cfg.youtube_api_key:
+    youtube_keys = cfg.youtube_api_keys or ((cfg.youtube_api_key,) if cfg.youtube_api_key else ())
+    if youtube_keys:
         try:
-            streams = YouTubeClient(cfg.youtube_api_key).recent_streams(cfg.channel_id, cfg.title_keyword)
-            ok(f"YouTube Data API 正常，找到 {len(streams)} 場直播（現在台灣時間 {now:%Y-%m-%d %H:%M}）：")
+            yt_client = YouTubeClient(youtube_keys)
+            streams = yt_client.recent_streams(cfg.channel_id, cfg.title_keyword)
+            yt_info = f"（共 {len(yt_client.api_keys)} 組金鑰）" if len(yt_client.api_keys) > 1 else ""
+            ok(f"YouTube Data API 正常{yt_info}，找到 {len(streams)} 場直播（現在台灣時間 {now:%Y-%m-%d %H:%M}）：")
             for s in streams:
                 print(f"     {s.episode_date}  {s.video_id}  {s.duration_sec // 60:>3d} 分鐘  "
                       f"{s.status_text(now, cfg.ready_delay_minutes)}  {s.title}")
@@ -108,12 +115,23 @@ def run_check() -> int:
         except Exception as exc:
             fail(f"Google 試算表失敗：{exc}")
 
-    if cfg.gemini_api_key:
+    gemini_keys = cfg.gemini_api_keys or ((cfg.gemini_api_key,) if cfg.gemini_api_key else ())
+    if gemini_keys:
         try:
-            transcriber = Transcriber(cfg.gemini_api_key, cfg.gemini_model, cfg.segment_minutes,
+            transcriber = Transcriber(gemini_keys, cfg.gemini_model, cfg.segment_minutes,
                                       cfg.video_fps, cfg.vocabulary, cfg.gemini_fallback_model)
             names = transcriber.check_models()
-            ok(f"Gemini API 金鑰有效，主要模型 {names[0]}" + (f"，備援模型 {names[1]}" if len(names) > 1 else "，未設定備援模型"))
+            total_keys = len(transcriber.api_keys)
+            key_info = f"（共 {total_keys} 組金鑰已啟用備援輪替）" if total_keys > 1 else ""
+            ok(f"Gemini API 金鑰有效{key_info}，主要模型 {names[0]}" + (f"，備援模型 {names[1]}" if len(names) > 1 else "，未設定備援模型"))
+            if total_keys > 1:
+                for i, client in enumerate(transcriber.clients, 1):
+                    try:
+                        for m in transcriber.models:
+                            client.models.get(model=m)
+                        print(f"     金鑰 #{i} 驗證正常")
+                    except Exception as k_exc:
+                        fail(f"金鑰 #{i} 驗證失敗：{k_exc}")
         except Exception as exc:
             models = " / ".join(m for m in (cfg.gemini_model, cfg.gemini_fallback_model) if m)
             fail(f"Gemini API 失敗（模型 {models}）：{exc}")
@@ -159,9 +177,9 @@ def run_transcribe(args: argparse.Namespace) -> int:
     cfg = config.load_settings()
     ctx = Context(
         cfg=cfg,
-        youtube=YouTubeClient(cfg.youtube_api_key),
+        youtube=YouTubeClient(cfg.youtube_api_keys or cfg.youtube_api_key),
         store=SheetStore(cfg.spreadsheet_id, config.parse_service_account(cfg.service_account_json)),
-        transcriber=Transcriber(cfg.gemini_api_key, cfg.gemini_model, cfg.segment_minutes, cfg.video_fps,
+        transcriber=Transcriber(cfg.gemini_api_keys or cfg.gemini_api_key, cfg.gemini_model, cfg.segment_minutes, cfg.video_fps,
                                 cfg.vocabulary, cfg.gemini_fallback_model),
         scheduled=os.getenv("GITHUB_EVENT_NAME") == "schedule",
         mailer=notifier.Mailer.from_settings(cfg),
@@ -263,7 +281,10 @@ def process_once(ctx: Context, args: argparse.Namespace) -> tuple[int, bool]:
             models = " + ".join(transcriber.models_used)
             store.append_transcript(stream, text, models)
         except QuotaExhausted as exc:
-            message = f"所有模型（{' / '.join(transcriber.models)}）額度都用完：{exc}"
+            if len(transcriber.api_keys) > 1:
+                message = f"所有 API 金鑰（共 {len(transcriber.api_keys)} 組）與模型（{' / '.join(transcriber.models)}）額度都用完：{exc}"
+            else:
+                message = f"所有模型（{' / '.join(transcriber.models)}）額度都用完：{exc}"
             log.error("%s", message)
             store.log(mode, stream, RESULT_QUOTA, message)
             failures.append((stream, message))
@@ -277,7 +298,8 @@ def process_once(ctx: Context, args: argparse.Namespace) -> tuple[int, bool]:
             had_error = True
             continue
         chars = len("".join(text.split()))
-        log.info("完成：%s，共 %d 字（模型 %s），已寫入試算表", stream.title, chars, models)
+        key_tag = f"，金鑰 #{'/'.join(map(str, transcriber.keys_used))}" if getattr(transcriber, "keys_used", None) else ""
+        log.info("完成：%s，共 %d 字（模型 %s%s），已寫入試算表", stream.title, chars, models, key_tag)
         store.log(mode, stream, RESULT_OK, f"{chars} 字，模型 {models}")
         written.append({"stream": stream, "title": stream.title, "url": stream.url, "chars": chars,
                         "models": models, "preview": text[:400]})
