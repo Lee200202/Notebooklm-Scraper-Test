@@ -1,0 +1,8 @@
+# 金鑰一律放 GitHub Secrets，絕對不要提交到 repo
+.env
+key.json
+*service_account*.json
+*.pem
+
+__pycache__/
+.venv/

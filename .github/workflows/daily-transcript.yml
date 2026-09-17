@@ -1,0 +1,72 @@
+name: 每日直播逐字稿
+
+on:
+  schedule:
+    # 台灣時間 週一～週五 11:20～11:55，每 5 分鐘檢查一次（20/5 = 從第 20 分開始每 5 分鐘）
+    - cron: "20/5 11 * * 1-5"
+      timezone: "Asia/Taipei"
+    # 台灣時間 週一～週五 12:00～13:55，直播延長或 YouTube 處理較慢時的緩衝
+    - cron: "*/5 12-13 * * 1-5"
+      timezone: "Asia/Taipei"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check＝只檢查設定（不轉錄）｜daily＝抓今天那一集｜init＝補抓最新 5 集中尚未寫入的"
+        type: choice
+        options: [check, daily, init]
+        default: check
+      video_id:
+        description: "（選填）只轉錄這支影片，例如 r5YtdmBoMEA。有填時會忽略上面的 mode"
+        type: string
+        required: false
+        default: ""
+
+# 最小權限：只需要讀取程式碼
+permissions:
+  contents: read
+
+# 同一時間只跑一個：轉錄要好幾分鐘，避免下一個 5 分鐘排程重複轉同一集
+concurrency:
+  group: daily-transcript
+  cancel-in-progress: false
+
+jobs:
+  transcript:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安裝套件
+        run: pip install -r requirements.txt
+
+      - name: 執行
+        env:
+          # ---- Secrets（必填）----
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          # ---- Variables（選填，沒設定就用程式預設值）----
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          SEGMENT_MINUTES: ${{ vars.SEGMENT_MINUTES }}
+          VIDEO_FPS: ${{ vars.VIDEO_FPS }}
+          INIT_VIDEO_COUNT: ${{ vars.INIT_VIDEO_COUNT }}
+          READY_DELAY_MINUTES: ${{ vars.READY_DELAY_MINUTES }}
+          MAX_ATTEMPTS_PER_DAY: ${{ vars.MAX_ATTEMPTS_PER_DAY }}
+          CUSTOM_VOCABULARY: ${{ vars.CUSTOM_VOCABULARY }}
+          # ---- 手動執行的輸入值；排程觸發時為空，所以預設 daily ----
+          # 透過環境變數傳入，不直接嵌進指令，避免指令注入
+          MODE: ${{ inputs.mode || 'daily' }}
+          VIDEO_ID: ${{ inputs.video_id }}
+        run: |
+          if [ -n "$VIDEO_ID" ]; then
+            python main.py --video-id "$VIDEO_ID"
+          else
+            python main.py --mode "$MODE"
+          fi

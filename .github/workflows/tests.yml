@@ -1,0 +1,28 @@
+name: 測試
+
+# 程式碼有變動時跑離線測試（不需要任何金鑰、不會呼叫外部服務）
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安裝套件
+        run: pip install -r requirements.txt
+
+      - name: 執行測試
+        run: python -m unittest discover -s tests -v
