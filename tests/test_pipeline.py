@@ -7,6 +7,7 @@ import base64
 import io
 import json
 import os
+import smtplib
 import sys
 import threading
 import unittest
@@ -22,6 +23,7 @@ import gspread  # noqa: E402
 
 import config  # noqa: E402
 import main  # noqa: E402
+import notifier  # noqa: E402
 import sheet_store  # noqa: E402
 import transcriber  # noqa: E402
 import youtube_client  # noqa: E402
@@ -102,6 +104,27 @@ class FakeGemini(BaseHTTPRequestHandler):
             text = f"{processing['start_offset']}-{processing['end_offset']} 台積電 2330 漲 3.5%。"
             payload["steps"] = [{"type": "model_output", "content": [{"type": "text", "text": text}]}]
         self._send(200, payload)
+
+
+# ---------------------------------------------------------------- 假的 Gmail SMTP
+class FakeSMTP:
+    sent: list = []
+    logins: list = []
+    fail_login = False
+
+    def __init__(self, host, port, timeout=None):
+        assert (host, port) == ("smtp.gmail.com", 465)
+
+    def login(self, user, password):
+        if FakeSMTP.fail_login:
+            raise smtplib.SMTPAuthenticationError(535, b"Username and Password not accepted")
+        FakeSMTP.logins.append((user, password))
+
+    def send_message(self, message):
+        FakeSMTP.sent.append(message)
+
+    def quit(self):
+        pass
 
 
 # ---------------------------------------------------------------- 記憶體中的試算表
@@ -198,6 +221,7 @@ class PipelineTest(unittest.TestCase):
         FakeGemini.final_status = staticmethod(lambda index: "completed")
         FakeGemini.post_error = staticmethod(lambda call_no, body: None)
         FakeGemini.poll_error = staticmethod(lambda index, count: None)
+        FakeSMTP.sent, FakeSMTP.logins, FakeSMTP.fail_login = [], [], False
         self.book = FakeSpreadsheet()
         self.videos = {}
         self.today = datetime.now(TAIPEI).date()
@@ -211,7 +235,10 @@ class PipelineTest(unittest.TestCase):
                 "GOOGLE_SERVICE_ACCOUNT_JSON": encoded_account, "GITHUB_ACTIONS": "false",
                 # 模擬 GitHub 未設定的 Variables：空字串要改用預設值
                 "GEMINI_MODEL": "", "SEGMENT_MINUTES": "", "VIDEO_FPS": "",
+                "MAIL_USERNAME": "", "MAIL_APP_PASSWORD": "", "MAIL_TO": "",  # 預設不寄信
+                "GITHUB_REPOSITORY": "owner/repo", "GITHUB_EVENT_NAME": "",
             }),
+            mock.patch.object(notifier.smtplib, "SMTP_SSL", FakeSMTP),
             mock.patch.object(transcriber.genai, "Client",
                               lambda api_key: real_client(api_key=api_key, http_options={"base_url": base_url})),
             mock.patch.object(transcriber, "POLL_SECONDS", 0),
@@ -381,9 +408,16 @@ class PipelineTest(unittest.TestCase):
         self.run_main("--mode", "init")  # 今天還在直播，init 只會寫入舊的那集
         self.videos[TODAY] = make_video(TODAY, self.today, 3995)
         FakeGemini.final_status = staticmethod(lambda index: "failed")
-        with mock.patch.dict(os.environ, {"GITHUB_EVENT_NAME": "schedule"}):
-            codes = [self.run_main()[0] for _ in range(4)]
-        self.assertEqual(codes, [1, 1, 1, 0])  # 第 4 次暫停，不再寄失敗通知
+        codes, requests_per_run = [], []
+        with mock.patch.dict(os.environ, {"GITHUB_EVENT_NAME": "schedule"}), redirect_stdout(io.StringIO()) as out:
+            for _ in range(4):
+                before = len(FakeGemini.requests)
+                codes.append(self.run_main()[0])
+                requests_per_run.append(len(FakeGemini.requests) - before)
+        # 排程的轉錄失敗不讓 job 失敗（避免 GitHub 立即寄信），改在 Actions 加錯誤標註、17:05 寄報告
+        self.assertEqual(codes, [0, 0, 0, 0])
+        self.assertIn("::error title=轉錄未完成", out.getvalue())
+        self.assertEqual(requests_per_run, [3, 3, 3, 0])  # 第 4 次暫停，不再送出請求
         self.assertEqual(self.log_results()[-3:], ["失敗"] * 3)
 
         # 在 Actions 頁面手動執行 init：不受每日失敗次數限制
@@ -572,6 +606,107 @@ class PipelineTest(unittest.TestCase):
             config.load_settings()
         with mock.patch.dict(os.environ, {"POLL_START": "15:00", "POLL_END": "14:00"}), self.assertRaises(ConfigError):
             config.load_settings()
+
+    # -- 寄信通知 ----------------------------------------------------------------
+    def enable_mail(self):
+        p = mock.patch.dict(os.environ, {"MAIL_USERNAME": "bot@gmail.com", "MAIL_APP_PASSWORD": "abcd efgh ijkl mnop",
+                                         "MAIL_TO": "me@example.com, you@example.com"})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def run_report(self):
+        with mock.patch.dict(os.environ, {"GITHUB_EVENT_NAME": "schedule"}):
+            return self.run_main("--mode", "report")
+
+    def test_success_email_is_sent_right_after_transcription(self):
+        self.enable_mail()
+        self.set_channel(count=1)
+        self.assertEqual(self.run_main("--video-id", TODAY)[0], 0)
+        self.assertEqual(len(FakeSMTP.sent), 1)
+        message = FakeSMTP.sent[0]
+        body = message.get_content()
+        self.assertTrue(message["Subject"].startswith("✅ 逐字稿完成："))
+        self.assertEqual(message["To"], "me@example.com, you@example.com")
+        self.assertEqual(FakeSMTP.logins, [("bot@gmail.com", "abcdefghijklmnop")])  # 應用程式密碼去掉空白
+        self.assertIn("字數：", body)
+        self.assertIn("台積電", body)  # 開頭預覽
+        self.assertIn("https://docs.google.com/spreadsheets/d/sheet-id", body)
+        self.assertIn("https://github.com/owner/repo/actions/workflows/daily-transcript.yml", body)
+        self.assertIn("已寄成功通知", self.log_results())
+
+    def test_no_email_when_mail_is_not_configured(self):
+        self.set_channel(count=1)
+        self.assertEqual(self.run_main("--video-id", TODAY)[0], 0)
+        self.assertEqual(FakeSMTP.sent, [])
+
+    def test_scheduled_failure_sends_one_report_at_1705(self):
+        self.enable_mail()
+        self.set_channel(count=2, live="live")
+        self.run_main("--mode", "init")  # 寫入舊的那集（會寄一封成功通知）
+        FakeSMTP.sent.clear()
+        self.videos[TODAY] = make_video(TODAY, self.today, 3995)
+        FakeGemini.final_status = staticmethod(lambda index: "failed")
+        with mock.patch.dict(os.environ, {"GITHUB_EVENT_NAME": "schedule"}), redirect_stdout(io.StringIO()):
+            self.assertEqual(self.run_main()[0], 0)
+        self.assertEqual(FakeSMTP.sent, [])  # 失敗當下不寄信
+
+        self.assertEqual(self.run_report()[0], 0)
+        self.assertEqual(len(FakeSMTP.sent), 1)
+        body = FakeSMTP.sent[0].get_content()
+        self.assertTrue(FakeSMTP.sent[0]["Subject"].startswith("❌ 逐字稿未完成："))
+        self.assertIn("失敗", body)
+        self.assertIn("重試 3 次仍失敗", body)
+        self.assertIn(f"video_id 填 {TODAY}", body)
+
+        self.run_report()  # 同一天再執行不重複寄
+        self.assertEqual(len(FakeSMTP.sent), 1)
+
+    def test_report_resends_success_email_that_was_not_delivered(self):
+        self.enable_mail()
+        self.set_channel(count=1)
+        FakeSMTP.fail_login = True
+        self.assertEqual(self.run_main("--video-id", TODAY)[0], 0)  # 寄信失敗不影響轉錄結果
+        self.assertIn("寄信失敗", self.log_results())
+        self.assertEqual(self.rows()[0][3], TODAY)
+
+        FakeSMTP.fail_login = False
+        self.run_report()
+        self.assertEqual(len(FakeSMTP.sent), 1)
+        self.assertTrue(FakeSMTP.sent[0]["Subject"].startswith("✅ 逐字稿完成："))
+        self.assertIn("台積電", FakeSMTP.sent[0].get_content())
+        self.run_report()
+        self.assertEqual(len(FakeSMTP.sent), 1)
+
+    def test_report_sends_nothing_when_done_and_notified_or_no_stream(self):
+        self.enable_mail()
+        self.set_channel(count=1)
+        self.run_main("--video-id", TODAY)
+        self.run_report()
+        self.assertEqual(len(FakeSMTP.sent), 1)  # 只有轉錄當下那封
+
+        del self.videos[TODAY]  # 休市日
+        self.run_report()
+        self.assertEqual(len(FakeSMTP.sent), 1)
+
+    def test_check_mode_sends_test_email(self):
+        self.enable_mail()
+        self.set_channel()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = main.main(["--mode", "check"])
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertEqual(out.getvalue().count("✅"), 5)
+        self.assertEqual([m["Subject"] for m in FakeSMTP.sent], ["✅ 設定檢查：寄信測試"])
+
+    def test_mail_settings_must_be_paired(self):
+        with mock.patch.dict(os.environ, {"MAIL_USERNAME": "bot@gmail.com"}):
+            with self.assertRaises(ConfigError):
+                config.load_settings()
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.set_channel()
+                self.assertEqual(main.main(["--mode", "check"]), 1)
+            self.assertIn("MAIL_USERNAME 和 MAIL_APP_PASSWORD 要一起設定", out.getvalue())
 
     def test_invalid_video_id_is_rejected(self):
         with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()), mock.patch("sys.stderr", io.StringIO()):

@@ -6,10 +6,17 @@
   python main.py --mode init         # 抓頻道最新 5 場已結束直播中尚未寫入的
   python main.py --video-id XXXX     # 只處理指定影片
   python main.py --mode daily --watch  # 排程用：等到 11:20，每 3 分鐘檢查一次，直到今天這集轉錄完成或 14:00
+  python main.py --mode report       # 排程用（17:05）：今天這集若仍未完成，寄一封失敗報告
+
+通知信（有設定 MAIL_USERNAME／MAIL_APP_PASSWORD 時）：
+  - 轉錄成功：寫入試算表後立即寄出
+  - 轉錄失敗：排程一天內會自動重試，不逐次寄信；由 17:05 的 report 統一寄一封
 
 「同一集每天最多失敗幾次」的限制只套用在排程觸發的執行；手動執行不受限制。
 
 結束代碼：0 = 正常（包含「今天還沒好，下次再查」），1 = 有錯誤（GitHub 會寄 email 通知）。
+排程執行時「轉錄失敗／額度不足」不回傳 1（避免 GitHub 立即寄信），改由 17:05 的報告通知；
+金鑰、試算表、YouTube API 等系統性錯誤仍回傳 1。
 """
 import argparse
 import logging
@@ -21,6 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import config
+import notifier
 from config import ConfigError
 from youtube_client import YouTubeClient
 
@@ -39,7 +47,7 @@ def sleep(seconds: float) -> None:  # 包一層，測試時可以替換成假時
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--mode", choices=["check", "daily", "init"], default="daily")
+    parser.add_argument("--mode", choices=["check", "daily", "init", "report"], default="daily")
     parser.add_argument("--video-id", default="", help="只處理這支影片")
     parser.add_argument("--force", action="store_true", help="影片已在試算表中也重新轉錄（會新增一列）")
     parser.add_argument("--watch", action="store_true",
@@ -110,6 +118,21 @@ def run_check() -> int:
             models = " / ".join(m for m in (cfg.gemini_model, cfg.gemini_fallback_model) if m)
             fail(f"Gemini API 失敗（模型 {models}）：{exc}")
 
+    if cfg.mail_username and cfg.mail_app_password:
+        try:
+            notifier.Mailer.from_settings(cfg).send(
+                "✅ 設定檢查：寄信測試",
+                f"這是「張震逐字稿」的寄信測試（{now:%Y-%m-%d %H:%M}）。\n收到這封信代表寄信設定正確：\n"
+                "  • 轉錄成功：寫入試算表後立即通知\n  • 轉錄失敗：每天 17:05 若今天這集仍未完成，寄一封失敗報告",
+            )
+            ok(f"Gmail 寄信正常，已寄出測試信給 {len(cfg.mail_to)} 位收件者，請到信箱確認")
+        except Exception as exc:
+            fail(f"寄信失敗：{exc}（MAIL_USERNAME 要填完整 Gmail 地址，MAIL_APP_PASSWORD 要填 16 碼應用程式密碼）")
+    elif cfg.mail_username or cfg.mail_app_password:
+        fail("MAIL_USERNAME 和 MAIL_APP_PASSWORD 要一起設定")
+    else:
+        print("ℹ️ 未設定寄信（選填）：不會寄送成功／失敗通知")
+
     print("\n全部檢查通過，可以開始轉錄。" if problems == 0 else f"\n有 {problems} 項需要修正，請依上面的訊息調整後重新執行。")
     return 0 if problems == 0 else 1
 
@@ -121,6 +144,7 @@ class Context:
     store: object  # SheetStore
     transcriber: object  # Transcriber
     scheduled: bool
+    mailer: "notifier.Mailer | None"
 
 
 def run_transcribe(args: argparse.Namespace) -> int:
@@ -140,7 +164,10 @@ def run_transcribe(args: argparse.Namespace) -> int:
         transcriber=Transcriber(cfg.gemini_api_key, cfg.gemini_model, cfg.segment_minutes, cfg.video_fps,
                                 cfg.vocabulary, cfg.gemini_fallback_model),
         scheduled=os.getenv("GITHUB_EVENT_NAME") == "schedule",
+        mailer=notifier.Mailer.from_settings(cfg),
     )
+    if args.mode == "report":
+        return run_report(ctx)
     if args.watch:
         return run_watch(ctx, args)
     return process_once(ctx, args)[0]
@@ -214,6 +241,8 @@ def process_once(ctx: Context, args: argparse.Namespace) -> tuple[int, bool]:
         targets = [s for s in targets if s.video_id not in done]
 
     had_error = waiting = False
+    written: list[dict] = []
+    failures: list[tuple[object, str]] = []
     for stream in targets:
         if not stream.is_ready(now, cfg.ready_delay_minutes):
             log.info("%s %s：%s", stream.episode_date, stream.video_id, stream.status_text(now, cfg.ready_delay_minutes))
@@ -237,18 +266,102 @@ def process_once(ctx: Context, args: argparse.Namespace) -> tuple[int, bool]:
             message = f"所有模型（{' / '.join(transcriber.models)}）額度都用完：{exc}"
             log.error("%s", message)
             store.log(mode, stream, RESULT_QUOTA, message)
+            failures.append((stream, message))
             had_error = True
             break  # 今天的配額用完，後面的影片也不用試了
         except Exception as exc:
             log.exception("轉錄 %s 失敗", stream.video_id)
-            store.log(mode, stream, RESULT_FAILED, f"{type(exc).__name__}: {exc}")
+            message = f"{type(exc).__name__}: {exc}"
+            store.log(mode, stream, RESULT_FAILED, message)
+            failures.append((stream, message))
             had_error = True
             continue
         chars = len("".join(text.split()))
         log.info("完成：%s，共 %d 字（模型 %s），已寫入試算表", stream.title, chars, models)
         store.log(mode, stream, RESULT_OK, f"{chars} 字，模型 {models}")
+        written.append({"stream": stream, "title": stream.title, "url": stream.url, "chars": chars,
+                        "models": models, "preview": text[:400]})
 
-    return (1 if had_error else 0), waiting and not had_error
+    if written:
+        notify_success(ctx, written, failures)
+
+    code = 1 if had_error else 0
+    if had_error and ctx.scheduled:
+        # 排程會在今天稍後自動重試，失敗時不讓 GitHub 立即寄信；若到 17:05 仍未完成，由 report 寄失敗報告。
+        # 仍在 Actions 頁面加上錯誤標註，方便查看
+        for stream, message in failures:
+            print(f"::error title=轉錄未完成 {stream.episode_date}::{' '.join(message.split())[:500]}", flush=True)
+        log.warning("本次排程有集數未完成（已記錄到「執行紀錄」）；之後的排程會再試，17:05 仍未完成會寄失敗報告")
+        code = 0
+    return code, waiting and not had_error
+
+
+def notify_success(ctx: Context, written: list[dict], failures: list[tuple[object, str]]) -> None:
+    from sheet_store import RESULT_MAIL_ERROR, RESULT_MAIL_SUCCESS
+
+    if not ctx.mailer:
+        return
+    subject, body = notifier.success_email(
+        written, [(stream.title, message) for stream, message in failures],
+        notifier.sheet_url(ctx.cfg.spreadsheet_id), notifier.actions_url(),
+    )
+    try:
+        ctx.mailer.send(subject, body)
+    except Exception as exc:
+        # 寄信失敗不影響逐字稿（已寫入）；17:05 的 report 會替今天這集補寄
+        log.warning("寄送成功通知失敗：%s（17:05 的報告會替今天這集補寄）", exc)
+        for item in written:
+            ctx.store.log("mail", item["stream"], RESULT_MAIL_ERROR, f"{type(exc).__name__}: {exc}")
+        return
+    for item in written:
+        ctx.store.log("mail", item["stream"], RESULT_MAIL_SUCCESS)
+
+
+def run_report(ctx: Context) -> int:
+    """每天 17:05（排程）：今天的直播若仍未寫入試算表，寄一封失敗報告；
+    若已完成但成功通知當時沒寄出（例如寄信失敗），補寄成功通知。每集每天最多各寄一次。"""
+    from sheet_store import RESULT_MAIL_FAILURE, RESULT_MAIL_SUCCESS
+
+    cfg, store = ctx.cfg, ctx.store
+    if not ctx.mailer:
+        log.warning("尚未設定寄信（MAIL_USERNAME／MAIL_APP_PASSWORD），無法寄送每日報告")
+        return 0
+    now = now_taipei()
+    today = now.date()
+    streams = [s for s in ctx.youtube.recent_streams(cfg.channel_id, cfg.title_keyword) if s.episode_date == today]
+    if not streams:
+        log.info("今天（%s）YouTube 上沒有直播（可能休市），不寄報告", today)
+        return 0
+
+    done = store.existing_video_ids()
+    rows = store.log_rows()
+    sheet, actions = notifier.sheet_url(cfg.spreadsheet_id), notifier.actions_url()
+    for stream in streams:
+        mine = [row for row in rows if row[3] == stream.video_id]
+        if stream.video_id in done:
+            if any(row[4] == RESULT_MAIL_SUCCESS for row in mine):
+                log.info("%s 已完成，成功通知已寄過", stream.title)
+                continue
+            row = store.transcript_row(stream.video_id) or []
+            item = {"title": stream.title, "url": stream.url,
+                    "chars": int(row[8]) if len(row) > 8 and row[8].isdigit() else 0,
+                    "models": row[9] if len(row) > 9 else "", "preview": row[11][:400] if len(row) > 11 else ""}
+            subject, body = notifier.success_email([item], [], sheet, actions)
+            result = RESULT_MAIL_SUCCESS
+        else:
+            if any(row[4] == RESULT_MAIL_FAILURE and row[0].startswith(today.isoformat()) for row in mine):
+                log.info("%s 未完成，今天已寄過失敗報告", stream.title)
+                continue
+            today_rows = [row for row in mine if row[0].startswith(today.isoformat()) and row[1] != "mail"]
+            subject, body = notifier.failure_email(
+                stream.title, stream.url, stream.video_id, stream.status_text(now, cfg.ready_delay_minutes),
+                f"{now:%Y-%m-%d %H:%M}", today_rows, sheet, actions,
+            )
+            result = RESULT_MAIL_FAILURE
+        ctx.mailer.send(subject, body)  # 報告寄不出去就讓這次執行失敗，GitHub 會寄信提醒
+        store.log("mail", stream, result)
+        log.info("%s：%s", result, stream.title)
+    return 0
 
 
 def setup_logging() -> None:

@@ -132,6 +132,28 @@ bash setup.sh
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | 步驟 2 的 ③ |
 | `SPREADSHEET_ID` | 步驟 3 的試算表 ID |
 
+### 步驟 4-2：設定寄信通知（選填，建議）
+
+設定後的寄信時機：
+- **轉錄成功**：寫入試算表後立即寄一封。
+- **轉錄失敗**：不會每次失敗都寄，因為排程一天內會自動重試很多次。每天 **17:05** 如果今天這集還沒完成，才寄一封失敗報告，附上當天的錯誤紀錄和補抓方式。
+
+設定方式（寄件帳號建議用**個人 Gmail**，學校／公司帳號不能建立應用程式密碼）：
+
+1. 寄件的 Gmail 帳號要先開啟「兩步驟驗證」：<https://myaccount.google.com/signinoptions/two-step-verification>
+2. 開啟 <https://myaccount.google.com/apppasswords>，名稱輸入 `transcript-bot`，按「建立」，複製 16 碼密碼
+3. 在 GitHub Secrets 新增：
+
+| Name | Secret |
+|---|---|
+| `MAIL_USERNAME` | 寄件的完整 Gmail 地址，例如 `yourname@gmail.com` |
+| `MAIL_APP_PASSWORD` | 上一步的 16 碼應用程式密碼，有沒有空格都可以 |
+| `MAIL_TO` | （選填）收件者，多位用半形逗號分隔；不設定就寄給 `MAIL_USERNAME` 自己 |
+
+> 應用程式密碼可以登入該 Gmail 信箱，請務必只存在 GitHub Secrets。
+> 你有多個帳號的話，建議用一個**專門寄通知的 Gmail** 當寄件帳號，收件者再填平常用的信箱。
+> 不想再用時，到上面的應用程式密碼頁面刪除這組密碼即可。
+
 ### 步驟 5：執行「檢查設定」
 
 1. 開啟 <https://github.com/Lee200202/Notebooklm-Scraper-Test/actions/workflows/daily-transcript.yml>
@@ -144,12 +166,14 @@ bash setup.sh
      2026-09-17  r5YtdmBoMEA   66 分鐘  可轉錄  2026/09/17(四)張震  股市盤中家教班
      ...
 ✅ Google 試算表可讀寫，目前已有 0 集逐字稿（「執行紀錄」已新增一列檢查紀錄）
-✅ Gemini API 金鑰有效，可使用模型 gemini-3.8-flash（Gemini 3.8 Flash）
+✅ Gemini API 金鑰有效，主要模型 gemini-3.8-flash（Gemini 3.8 Flash），備援模型 gemini-3.5-flash-lite（…）
+✅ Gmail 寄信正常，已寄出測試信給 1 位收件者，請到信箱確認
 
 全部檢查通過，可以開始轉錄。
 ```
 
-`check` 不會轉錄，也不會用掉 Gemini 的生成額度。出現 ❌ 時依訊息修正，再執行一次。
+`check` 不會轉錄，也不會用掉 Gemini 的生成額度。有設定寄信時，每次 `check` 都會寄一封「✅ 設定檢查：寄信測試」。
+沒設定寄信時，這一行會顯示「ℹ️ 未設定寄信（選填）」，不算錯誤。出現 ❌ 時依訊息修正，再執行一次。
 
 ### 步驟 6：先試轉一集
 
@@ -171,16 +195,18 @@ bash setup.sh
 |---|---|
 | 平日 11:10 | 主要排程啟動（提早 10 分鐘，預留 GitHub 排程延遲），程式先等到 11:20 |
 | 11:20 起每 3 分鐘 | 在**同一次執行**中檢查今天的直播：還在直播、剛結束或 YouTube 還在處理 → 3 分鐘後再查，最晚到 14:00 |
-| 直播結束滿 5 分鐘後的那次檢查 | 開始轉錄並寫入試算表，完成後這次執行結束 |
+| 直播結束滿 5 分鐘後的那次檢查 | 開始轉錄並寫入試算表，**立即寄成功通知信**，這次執行結束 |
 | 平日 11:30、11:50、12:10～13:50 每 20 分鐘 | 備援排程：萬一 11:10 那次被 GitHub 延遲或略過就接手；今天那集已完成則立刻結束 |
 | 平日 15:10、15:40、16:10、16:40 | Gemini 每日額度重置後再檢查一次；今天那集已完成就直接結束 |
-| 轉錄失敗 | 記錄到「執行紀錄」，GitHub 寄失敗通知 email；下次排程重試，排程觸發時同一集一天最多失敗 3 次（手動執行不受限） |
+| 轉錄失敗 | 記錄到「執行紀錄」，並在 Actions 頁面標註錯誤，但**不會馬上寄信**；之後的排程自動重試，同一集一天最多失敗 3 次（手動執行不受限） |
+| 平日 17:05 | **每日報告**：今天這集還沒完成 → 寄一封失敗報告；已完成但成功通知當時沒寄出 → 補寄；休市日不寄 |
 | 假日、休市沒直播 | 找不到當天影片，直接結束，不算錯誤 |
 
 - **為什麼不是直接設「每 3 分鐘」的排程**：GitHub Actions 排程最短只能每 5 分鐘一次，而且尖峰時段可能延遲或跳過。所以改成 11:10 啟動一次，由程式自己等到 11:20、每 3 分鐘檢查。
 - **仍可能有的誤差**：如果 GitHub 把 11:10 的排程延遲超過 10 分鐘，第一次檢查就會晚於 11:20（啟動後立刻檢查，之後照樣每 3 分鐘）。萬一整次被略過，11:30 或 11:50 的備援排程會接手。
 - **在 Actions 列表看到「Cancelled」是正常的**：主要那次還在等待或轉錄時，備援排程會排隊；同時排隊的只保留最新一個，較舊的會被 GitHub 自動取消。
-- **看執行狀況**：<https://github.com/Lee200202/Notebooklm-Scraper-Test/actions>，以及試算表的「執行紀錄」工作表。
+- **看執行狀況**：<https://github.com/Lee200202/Notebooklm-Scraper-Test/actions>，以及試算表的「執行紀錄」工作表。寄信紀錄也會記在這裡（已寄成功通知／已寄失敗通知／寄信失敗）。
+- **GitHub 自己的失敗通知信**：排程執行時的「轉錄失敗／額度不足」不會讓 Actions 顯示失敗，所以 GitHub 不會立即寄信，改由 17:05 的報告通知。金鑰錯誤、試算表無法開啟、17:05 報告寄不出去等**系統性錯誤**，Actions 仍會顯示失敗，GitHub 會立即寄信。
 
 ## 試算表內容
 
@@ -213,9 +239,11 @@ bash setup.sh
 | `POLL_INTERVAL_MINUTES` | `3` | 每幾分鐘檢查一次 |
 | `MAX_ATTEMPTS_PER_DAY` | `3` | 排程觸發時，同一集一天失敗幾次就暫停自動重試（在 Actions 頁面手動執行不受限） |
 | `CUSTOM_VOCABULARY` | 股市常用詞 | 專有名詞提示，用半形逗號分隔，例如 `張震,台積電,外資` |
+| `SMTP_HOST` | `smtp.gmail.com` | 不用 Gmail 寄信時才需要改 |
+| `SMTP_PORT` | `465` | 465 = SSL；其他埠號會用 STARTTLS |
 
 - 聽打規則（繁體中文、數字格式、分段方式）寫在 [`config.py`](config.py) 的 `SYSTEM_INSTRUCTION`
-- 排程時間寫在 [`.github/workflows/daily-transcript.yml`](.github/workflows/daily-transcript.yml)，已經設定 `timezone: "Asia/Taipei"`
+- 排程時間寫在 [`.github/workflows/daily-transcript.yml`](.github/workflows/daily-transcript.yml)，已經設定 `timezone: "Asia/Taipei"`。修改 17:05 報告的 cron 時，同檔案「執行」步驟裡比對的 cron 字串也要一起改
 - 兩者都可以直接在 GitHub 網頁上按鉛筆圖示修改並 commit
 
 ## 額度與費用
@@ -280,6 +308,15 @@ base64 -w0 key.json; echo; rm -f key.json
 程式會等 30 秒、90 秒重試；仍然 429 就改用備援模型繼續。備援模型也用完，就記錄「配額不足」並停止，等 15:00 或 16:00 額度重置後的排程補跑。
 「模型」欄會記錄這集實際用了哪些模型，例如 `gemini-3.8-flash + gemini-3.5-flash-lite`。
 
+**Q：沒收到通知信？**
+依序確認：
+1. `check` 的寄信那一行是不是 ✅
+2. 信件是否被分到垃圾郵件或「促銷內容」
+3. 到「執行紀錄」看有沒有「寄信失敗」
+4. `MAIL_APP_PASSWORD` 必須是應用程式密碼，不是 Gmail 登入密碼
+
+注意：失敗報告只在 17:05 寄，而且只有「今天有直播但沒完成」時才會寄。
+
 **Q：逐字稿有漏段或變成摘要？**
 把 Variable `SEGMENT_MINUTES` 設成 `15`，每段越短越不容易漏，代價是請求次數加倍。
 
@@ -293,7 +330,8 @@ base64 -w0 key.json; echo; rm -f key.json
 
 | 檔案 | 用途 |
 |---|---|
-| [`main.py`](main.py) | 主流程：check／daily／init／指定影片 |
+| [`main.py`](main.py) | 主流程：check／daily（--watch）／init／report／指定影片 |
+| [`notifier.py`](notifier.py) | Gmail 寄信：成功通知、每日失敗報告、檢查用測試信 |
 | [`youtube_client.py`](youtube_client.py) | YouTube Data API：找直播、判斷是否已結束 |
 | [`transcriber.py`](transcriber.py) | Gemini API：分段聽打、背景執行輪詢、截斷自動切半、錯誤重試 |
 | [`sheet_store.py`](sheet_store.py) | Google 試算表：寫入逐字稿與執行紀錄 |

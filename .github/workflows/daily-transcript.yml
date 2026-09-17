@@ -17,12 +17,16 @@ on:
     # （台灣 15:00，美國冬令時間期間為 16:00），萬一早上因額度不足失敗，重置後再補一次
     - cron: "10,40 15-16 * * 1-5"
       timezone: "Asia/Taipei"
+    # 【每日報告】台灣時間 週一～週五 17:05（當天最後一次補跑之後）：今天這集若仍未完成，寄一封失敗通知信。
+    # 下面「執行」步驟用這個 cron 字串判斷要跑報告，修改時兩處要一起改
+    - cron: "5 17 * * 1-5"
+      timezone: "Asia/Taipei"
   workflow_dispatch:
     inputs:
       mode:
-        description: "check＝只檢查設定（不轉錄）｜daily＝抓今天那一集｜init＝補抓最新 5 集中尚未寫入的"
+        description: "check＝檢查設定並寄測試信（不轉錄）｜daily＝抓今天那一集｜init＝補抓最新 5 集中尚未寫入的｜report＝寄今天的報告"
         type: choice
-        options: [check, daily, init]
+        options: [check, daily, init, report]
         default: check
       video_id:
         description: "（選填）只轉錄這支影片，例如 r5YtdmBoMEA。有填時會忽略上面的 mode"
@@ -61,6 +65,10 @@ jobs:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          # ---- 寄信通知 Secrets（選填，沒設定就不寄信）----
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_APP_PASSWORD: ${{ secrets.MAIL_APP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
           # ---- Variables（選填，沒設定就用程式預設值）----
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           GEMINI_FALLBACK_MODEL: ${{ vars.GEMINI_FALLBACK_MODEL }}
@@ -73,13 +81,19 @@ jobs:
           POLL_INTERVAL_MINUTES: ${{ vars.POLL_INTERVAL_MINUTES }}
           MAX_ATTEMPTS_PER_DAY: ${{ vars.MAX_ATTEMPTS_PER_DAY }}
           CUSTOM_VOCABULARY: ${{ vars.CUSTOM_VOCABULARY }}
+          SMTP_HOST: ${{ vars.SMTP_HOST }}
+          SMTP_PORT: ${{ vars.SMTP_PORT }}
           # ---- 手動執行的輸入值；排程觸發時為空，所以預設 daily ----
           # 透過環境變數傳入，不直接嵌進指令，避免指令注入
           MODE: ${{ inputs.mode || 'daily' }}
           VIDEO_ID: ${{ inputs.video_id }}
+          # 觸發這次執行的 cron 字串（手動執行時為空）
+          SCHEDULE: ${{ github.event.schedule }}
         run: |
           if [ -n "$VIDEO_ID" ]; then
             python main.py --video-id "$VIDEO_ID"
+          elif [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ "$SCHEDULE" = "5 17 * * 1-5" ]; then
+            python main.py --mode report
           elif [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
             python main.py --mode daily --watch
           else

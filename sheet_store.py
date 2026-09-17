@@ -21,6 +21,9 @@ RESULT_OK = "成功"
 RESULT_FAILED = "失敗"
 RESULT_QUOTA = "配額不足"
 RESULT_CHECK = "設定檢查通過"
+RESULT_MAIL_SUCCESS = "已寄成功通知"
+RESULT_MAIL_FAILURE = "已寄失敗通知"
+RESULT_MAIL_ERROR = "寄信失敗"
 
 # 只要求試算表權限，不要求整個 Google 雲端硬碟的權限
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -101,6 +104,16 @@ class SheetStore:
             value_input_option="RAW",
             table_range="A1",
         )
+
+    def transcript_row(self, video_id: str) -> list[str] | None:
+        column = META_HEADER.index("影片ID")
+        for row in self.transcripts.get_all_values()[1:]:
+            if len(row) > column and row[column] == video_id:
+                return row
+        return None
+
+    def log_rows(self) -> list[list[str]]:
+        return [row + [""] * (len(LOG_HEADER) - len(row)) for row in self.log_sheet.get_all_values()[1:]]
 
     def failed_attempts_today(self, video_id: str) -> int:
         today = datetime.now(TAIPEI).strftime("%Y-%m-%d")

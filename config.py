@@ -145,6 +145,13 @@ class Settings:
     spreadsheet_id: str = field(repr=False)
     service_account_json: str = field(repr=False)  # 原文，使用時再用 parse_service_account 解析
 
+    # 寄信通知（選填）：Gmail 帳號與應用程式密碼都設定才會寄信
+    mail_username: str = field(repr=False)
+    mail_app_password: str = field(repr=False)
+    mail_to: tuple[str, ...] = field(repr=False)
+    smtp_host: str
+    smtp_port: int
+
 
 def load_settings(strict: bool = True) -> Settings:
     """strict=False 時允許 Secrets 缺漏（給 --mode check 逐項檢查用）。"""
@@ -153,6 +160,9 @@ def load_settings(strict: bool = True) -> Settings:
         raise ConfigError(f"缺少 GitHub Secrets：{', '.join(missing)}")
     if _clock("POLL_START", "11:20") >= _clock("POLL_END", "14:00"):
         raise ConfigError("POLL_START 必須早於 POLL_END")
+    mail_username, mail_password = env("MAIL_USERNAME"), env("MAIL_APP_PASSWORD")
+    if strict and bool(mail_username) != bool(mail_password):
+        raise ConfigError("MAIL_USERNAME 和 MAIL_APP_PASSWORD 要一起設定（或都不設定＝不寄信）")
     return Settings(
         youtube_api_key=env("YOUTUBE_API_KEY"),
         # @xinchenginsta（張震_股市盤中家教班）的頻道 ID
@@ -179,4 +189,10 @@ def load_settings(strict: bool = True) -> Settings:
         max_attempts_per_day=_number("MAX_ATTEMPTS_PER_DAY", 3, int, 1),
         spreadsheet_id=env("SPREADSHEET_ID"),
         service_account_json=env("GOOGLE_SERVICE_ACCOUNT_JSON"),
+        mail_username=mail_username,
+        mail_app_password=mail_password,
+        # 收件者預設寄給自己；多個收件者用半形逗號分隔
+        mail_to=tuple(a.strip() for a in env("MAIL_TO", mail_username).split(",") if a.strip()),
+        smtp_host=env("SMTP_HOST", "smtp.gmail.com"),
+        smtp_port=_number("SMTP_PORT", 465, int, 1),
     )
