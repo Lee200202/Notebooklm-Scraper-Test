@@ -55,6 +55,10 @@ class FakeGemini(BaseHTTPRequestHandler):
     post_error = staticmethod(lambda call_no, body: None)    # 回傳 (HTTP 狀態碼, JSON) 模擬送出失敗
     no_background_models: set = set()                        # 不支援背景模式的模型（只能用串流）
     stream_error = staticmethod(lambda processing, api_key: None)  # 回傳串流 error 事件（dict）模擬處理失敗
+    probes: list = []                                               # 金鑰快速檢查：(金鑰, 模型)
+    probe_error = staticmethod(lambda api_key, model: None)         # 回傳 (HTTP 狀態碼, JSON) 模擬檢查失敗
+    stream_disconnects = 0                                          # 串流送到一半就切斷連線的次數
+    resume_requests: list = []                                      # 接續串流的請求：(interaction ID, last_event_id)
     poll_error = staticmethod(lambda index, count: None)     # 回傳 (HTTP 狀態碼, JSON) 模擬輪詢失敗
 
     def log_message(self, *args):
@@ -72,6 +76,15 @@ class FakeGemini(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         body["_api_key"] = self.headers.get("x-goog-api-key")
         cls = type(self)
+        content = body["input"][0].get("content") if isinstance(body.get("input"), list) and body["input"] else None
+        if not (isinstance(content, list) and content and content[0].get("type") == "video"):
+            # 金鑰快速檢查（純文字小請求，同步回應）
+            cls.probes.append((body["_api_key"], body["model"]))
+            error = cls.probe_error(body["_api_key"], body["model"])
+            if error:
+                return self._send(*error)
+            return self._send(200, {"id": f"probe-{len(cls.probes)}", "status": "completed",
+                                    "steps": [{"type": "model_output", "content": [{"type": "text", "text": "OK"}]}]})
         cls.post_calls += 1
         error = cls.post_error(cls.post_calls, body)
         if error:
@@ -94,8 +107,40 @@ class FakeGemini(BaseHTTPRequestHandler):
         cls.polls[interaction_id] = {"count": 0, "index": len(cls.requests) - 1, "processing": video["processing"]}
         self._send(200, {"id": interaction_id, "status": "in_progress"})
 
+    def _stream_events(self, processing):
+        text = f"{processing['start_offset']}-{processing['end_offset']} 台積電 2330 漲 3.5%。"
+        return [
+            {"event_type": "interaction.created", "event_id": "e1", "interaction": {"id": "stream-1", "status": "in_progress"}},
+            {"event_type": "step.delta", "event_id": "e2", "index": 0, "delta": {"type": "text", "text": text[:10]}},
+            {"event_type": "step.delta", "event_id": "e3", "index": 0, "delta": {"type": "text", "text": text[10:]}},
+            {"event_type": "interaction.completed", "event_id": "e4", "interaction": {
+                "id": "stream-1", "status": "completed",
+                "usage": {"total_input_tokens": 80000, "total_output_tokens": 9000, "total_thought_tokens": 0}}},
+        ]
+
+    def _write_sse(self, events, cut_after=None):
+        body = "".join(f"data: {json.dumps(e, ensure_ascii=False)}\n\n" for e in events) + "data: [DONE]\n\n"
+        raw = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        if cut_after is None:
+            self.wfile.write(raw)
+            return
+        # 只送出前幾個事件就切斷連線（Content-Length 對不上 → 用戶端收到「incomplete message body」）
+        partial = "".join(f"data: {json.dumps(e, ensure_ascii=False)}\n\n" for e in events[:cut_after]).encode()
+        self.wfile.write(partial)
+        self.wfile.flush()
+        self.close_connection = True
+
     def _send_stream(self, processing, error_event=None):
         text = f"{processing['start_offset']}-{processing['end_offset']} 台積電 2330 漲 3.5%。"
+        cls = type(self)
+        if not error_event and cls.stream_disconnects > 0:
+            cls.stream_disconnects -= 1
+            cls.last_stream_processing = processing
+            return self._write_sse(self._stream_events(processing), cut_after=2)  # 收到 created 與第一段文字後斷線
         events = [{"event_type": "interaction.created", "interaction": {"id": "stream-1", "status": "in_progress"}},
                   error_event] if error_event else [
             {"event_type": "interaction.created", "interaction": {"id": "stream-1", "status": "in_progress"}},
@@ -115,6 +160,16 @@ class FakeGemini(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
+        query = self.path.split("?")[1] if "?" in self.path else ""
+        if "stream=true" in query:
+            # 接續串流：只回傳 last_event_id 之後的事件
+            params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
+            interaction_id = path.rstrip("/").split("/")[-1]
+            type(self).resume_requests.append((interaction_id, params.get("last_event_id")))
+            events = self._stream_events(type(self).last_stream_processing)
+            ids = [e["event_id"] for e in events]
+            after = ids.index(params["last_event_id"]) + 1 if params.get("last_event_id") in ids else 0
+            return self._write_sse(events[after:])
         if "/models/" in path:
             m_name = path.rstrip("/").split("/")[-1]
             return self._send(200, {"name": f"models/{m_name}", "displayName": m_name})
@@ -256,6 +311,10 @@ class PipelineTest(unittest.TestCase):
         FakeSMTP.sent, FakeSMTP.logins, FakeSMTP.fail_login = [], [], False
         FakeGemini.no_background_models = set()
         FakeGemini.stream_error = staticmethod(lambda processing, api_key: None)
+        FakeGemini.probes = []
+        FakeGemini.stream_disconnects = 0
+        FakeGemini.resume_requests = []
+        FakeGemini.probe_error = staticmethod(lambda api_key, model: None)
         self.book = FakeSpreadsheet()
         self.videos = {}
         self.today = datetime.now(TAIPEI).date()
@@ -270,6 +329,7 @@ class PipelineTest(unittest.TestCase):
                 # 模擬 GitHub 未設定的 Variables：空字串要改用預設值
                 "GEMINI_MODEL": "", "SEGMENT_MINUTES": "", "VIDEO_FPS": "",
                 "MAIL_USERNAME": "", "MAIL_APP_PASSWORD": "", "MAIL_TO": "",  # 預設不寄信
+                "KEY_PROBE": "false",  # 其他測試專注在轉錄流程；快速檢查另有專門測試
                 "GITHUB_REPOSITORY": "owner/repo", "GITHUB_EVENT_NAME": "",
             }),
             mock.patch.object(notifier.smtplib, "SMTP_SSL", FakeSMTP),
@@ -896,6 +956,101 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(row[3], TODAY)
         self.assertIn("0s-1800s 台積電 2330 漲 3.5%。", row[11])  # 分段收到的文字有完整接起來
         self.assertIn("3600s-3995s", row[11])
+
+    # -- 金鑰快速檢查 --------------------------------------------------------------
+    def enable_probe_with_two_keys(self):
+        p = mock.patch.dict(os.environ, {"KEY_PROBE": "true", "GEMINI_API_KEY": "key-1", "GEMINI_API_KEY_2": "key-2"})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_probe_skips_overloaded_key_before_sending_video(self):
+        # 金鑰 #1 目前負載過高：快速檢查幾秒內就發現，不送影片、不等 2 分鐘，馬上跳金鑰 #2
+        self.set_channel(count=1)
+        self.enable_probe_with_two_keys()
+        high_demand = (503, {"error": {"code": "unavailable", "message":
+                             f"{MODEL} is currently experiencing high demand, spikes in demand are usually temporary."}})
+        FakeGemini.probe_error = staticmethod(lambda api_key, model: high_demand if api_key == "key-1" else None)
+        with self.assertLogs("transcriber", level="INFO") as transcriber_logs:
+            code, _ = self.run_main("--video-id", TODAY)
+        self.assertEqual(code, 0)
+        self.assertEqual([r["_api_key"] for r in FakeGemini.requests], ["key-2"] * 3)  # 影片只送到金鑰 #2
+        self.assertEqual(FakeGemini.probes, [("key-1", MODEL), ("key-2", MODEL)])  # 金鑰 #2 通過後 5 分鐘內不重複檢查
+        logs = " | ".join(transcriber_logs.output)
+        self.assertIn("金鑰 #1 快速檢查未通過", logs)
+        self.assertIn("high demand", logs)
+        self.assertIn("馬上跳到金鑰 #2", logs)
+        self.assertIn("金鑰 #2 快速檢查通過", logs)
+        self.assertNotIn("秒後重新送出", logs)
+
+    def test_probe_quota_exhausted_key_is_skipped(self):
+        self.set_channel(count=1)
+        self.enable_probe_with_two_keys()
+        FakeGemini.probe_error = staticmethod(lambda api_key, model: QUOTA_EXCEEDED if api_key == "key-1" else None)
+        self.assertEqual(self.run_main("--video-id", TODAY)[0], 0)
+        self.assertEqual([r["_api_key"] for r in FakeGemini.requests], ["key-2"] * 3)
+
+    def test_probe_invalid_key_is_not_used_again(self):
+        self.set_channel(count=2)
+        self.enable_probe_with_two_keys()
+        invalid = (401, {"error": {"code": "unauthenticated", "message": "API key not valid."}})
+        FakeGemini.probe_error = staticmethod(lambda api_key, model: invalid if api_key == "key-1" else None)
+        self.assertEqual(self.run_main("--mode", "init")[0], 0)
+        self.assertEqual({r["_api_key"] for r in FakeGemini.requests}, {"key-2"})
+        self.assertEqual([p for p in FakeGemini.probes if p[0] == "key-1"], [("key-1", MODEL)])  # 只檢查一次
+
+    def test_probe_is_repeated_after_video_request_fails(self):
+        # 金鑰 #1 通過檢查但轉錄途中失敗 → 馬上換金鑰 #2（先檢查）；金鑰 #1 下次要用前會重新檢查
+        self.set_channel(count=1)
+        self.enable_probe_with_two_keys()
+        FakeGemini.final_status = staticmethod(lambda index: "failed" if index == 0 else "completed")
+        self.assertEqual(self.run_main("--video-id", TODAY)[0], 0)
+        self.assertEqual([r["_api_key"] for r in FakeGemini.requests], ["key-1", "key-2", "key-2", "key-2"])
+        self.assertEqual(FakeGemini.probes, [("key-1", MODEL), ("key-2", MODEL)])
+
+    def test_all_keys_fail_probe_waits_then_retries_round(self):
+        self.set_channel(count=1)
+        self.enable_probe_with_two_keys()
+        overloaded = (503, {"error": {"code": "unavailable", "message": "The model is overloaded."}})
+        FakeGemini.probe_error = staticmethod(lambda api_key, model: overloaded if len(FakeGemini.probes) <= 2 else None)
+        with self.assertLogs("transcriber", level="INFO") as transcriber_logs:
+            self.assertEqual(self.run_main("--video-id", TODAY)[0], 0)
+        self.assertIn("所有金鑰這一輪都失敗，30 秒後重新送出", " | ".join(transcriber_logs.output))
+        self.assertEqual(len(FakeGemini.requests), 3)
+
+    def test_probe_can_be_disabled(self):
+        self.set_channel(count=1)
+        with mock.patch.dict(os.environ, {"KEY_PROBE": "false"}):
+            self.assertEqual(self.run_main("--video-id", TODAY)[0], 0)
+        self.assertEqual(FakeGemini.probes, [])
+
+    def test_stream_disconnect_resumes_from_last_event(self):
+        # 重現 GitHub 上的錯誤：串流途中「peer closed connection without sending complete message body」
+        # → 用 interaction ID ＋ 最後的 event_id 接續，不重送影片、不換金鑰，文字不重複也不缺漏
+        self.set_channel(count=1)
+        FakeGemini.no_background_models = {MODEL}
+        FakeGemini.stream_disconnects = 1
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "key-1", "GEMINI_API_KEY_2": "key-2"}), \
+                self.assertLogs("transcriber", level="INFO") as transcriber_logs:
+            code, _ = self.run_main("--video-id", TODAY)
+        self.assertEqual(code, 0)
+        logs = " | ".join(transcriber_logs.output)
+        self.assertIn("串流連線中斷", logs)
+        self.assertIn("從中斷處接續接收（第 1 次）", logs)
+        self.assertNotIn("馬上改用金鑰 #2", logs)
+        self.assertEqual(FakeGemini.resume_requests, [("stream-1", "e2")])
+        self.assertEqual(len(FakeGemini.requests), 3)  # 影片每段只送一次
+        self.assertIn("【0:00:00 – 0:30:00】\n0s-1800s 台積電 2330 漲 3.5%。", self.rows()[0][11])
+
+    def test_stream_disconnect_too_many_times_switches_key(self):
+        self.set_channel(count=1)
+        FakeGemini.no_background_models = {MODEL}
+        FakeGemini.stream_disconnects = 1
+        with mock.patch.object(transcriber, "STREAM_RESUME_ATTEMPTS", 0), \
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "key-1", "GEMINI_API_KEY_2": "key-2"}), \
+                self.assertLogs("transcriber", level="INFO") as transcriber_logs:
+            code, _ = self.run_main("--video-id", TODAY)
+        self.assertEqual(code, 0)
+        self.assertIn("金鑰 #1 失敗，馬上改用金鑰 #2 重送", " | ".join(transcriber_logs.output))
 
     def test_invalid_video_id_is_rejected(self):
         with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()), mock.patch("sys.stderr", io.StringIO()):

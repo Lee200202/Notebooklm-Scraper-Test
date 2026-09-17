@@ -87,6 +87,9 @@ jobs:
           POLL_START: ${{ vars.POLL_START }}
           POLL_END: ${{ vars.POLL_END }}
           POLL_INTERVAL_MINUTES: ${{ vars.POLL_INTERVAL_MINUTES }}
+          KEY_PROBE: ${{ vars.KEY_PROBE }}
+          KEY_PROBE_TIMEOUT_SECONDS: ${{ vars.KEY_PROBE_TIMEOUT_SECONDS }}
+          KEY_PROBE_TTL_SECONDS: ${{ vars.KEY_PROBE_TTL_SECONDS }}
           MAX_ATTEMPTS_PER_DAY: ${{ vars.MAX_ATTEMPTS_PER_DAY }}
           CUSTOM_VOCABULARY: ${{ vars.CUSTOM_VOCABULARY }}
           SMTP_HOST: ${{ vars.SMTP_HOST }}

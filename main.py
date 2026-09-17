@@ -180,7 +180,9 @@ def run_transcribe(args: argparse.Namespace) -> int:
         youtube=YouTubeClient(cfg.youtube_api_keys or cfg.youtube_api_key),
         store=SheetStore(cfg.spreadsheet_id, config.parse_service_account(cfg.service_account_json)),
         transcriber=Transcriber(cfg.gemini_api_keys or cfg.gemini_api_key, cfg.gemini_model, cfg.segment_minutes, cfg.video_fps,
-                                cfg.vocabulary, cfg.gemini_fallback_model),
+                                cfg.vocabulary, cfg.gemini_fallback_model,
+                                probe=cfg.key_probe, probe_timeout=cfg.key_probe_timeout_seconds,
+                                probe_ttl=cfg.key_probe_ttl_seconds),
         scheduled=os.getenv("GITHUB_EVENT_NAME") == "schedule",
         mailer=notifier.Mailer.from_settings(cfg),
     )

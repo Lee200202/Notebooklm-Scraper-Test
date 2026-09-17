@@ -21,6 +21,9 @@ SEGMENT_TIMEOUT_SECONDS = 15 * 60  # 實測每段 1～3 分鐘，15 分鐘沒結
 MIN_SPLIT_SECONDS = 5 * 60
 MAX_SEGMENT_ATTEMPTS = 3
 RETRY_WAIT_SECONDS = (30, 90)  # 第 2、3 次送出前的等待秒數；兩次合計超過 1 分鐘，可避開每分鐘額度限制
+PROBE_PROMPT = "請只回覆：OK"
+STREAM_RESUME_ATTEMPTS = 3     # 串流連線中斷時，最多從中斷處接續幾次
+STREAM_RESUME_WAIT_SECONDS = 5
 NON_RETRYABLE_STATUS = {401, 403, 404}  # 金鑰無效、沒有權限、模型不存在：重試也不會成功
 
 
@@ -79,7 +82,8 @@ def _is_daily_quota(message: str) -> bool:
 class Transcriber:
     def __init__(self, api_key: str | tuple[str, ...] | list[str], model: str, segment_minutes: int, video_fps: float,
                  vocabulary: tuple[str, ...], fallback_model: str = "",
-                 api_keys: tuple[str, ...] | list[str] | None = None):
+                 api_keys: tuple[str, ...] | list[str] | None = None,
+                 probe: bool = True, probe_timeout: int = 20, probe_ttl: int = 300):
         if isinstance(api_key, (list, tuple)):
             raw_keys = list(api_key)
         elif api_keys:
@@ -108,6 +112,11 @@ class Transcriber:
         self.stream_models: set[str] = set()
         # (金鑰編號, 模型)：這組金鑰在這個模型的額度已用完，這次執行不再使用
         self.exhausted_keys: set[tuple[int, str]] = set()
+        # 金鑰快速檢查：送影片前先用極小請求確認金鑰＋模型目前可用，幾秒內就知道要不要跳下一組
+        self.probe_enabled = probe
+        self.probe_timeout = probe_timeout
+        self.probe_ttl = probe_ttl
+        self.healthy_until: dict[tuple[int, str], float] = {}  # (金鑰, 模型) → 確認可用的有效期限
         self.stage = "送出請求"
 
     @property
@@ -214,8 +223,20 @@ class Transcriber:
                 if (key, self.model) in self.exhausted_keys:
                     continue
                 self.key_index = key
-                attempt += 1
                 key_tag = f"，金鑰 #{key + 1}" if multi_key else ""
+
+                usable, reason, quota = self._probe_key(key)
+                if not usable:
+                    last_error = f"金鑰 #{key + 1} 快速檢查未通過（模型 {self.model}）：{reason}"
+                    log.warning("  %s", last_error)
+                    if not quota:
+                        all_quota = False
+                    remaining = [k for k in order[position + 1:] if (k, self.model) not in self.exhausted_keys]
+                    if remaining:
+                        log.warning("  馬上跳到金鑰 #%d", remaining[0] + 1)
+                    continue
+
+                attempt += 1
                 processing = {"type": "static", "start_offset": f"{start}s", "end_offset": f"{end}s"}
                 if use_fps:
                     processing["fps"] = self.video_fps
@@ -262,8 +283,10 @@ class Transcriber:
                     status = str(interaction.status)
                     text = _output_text(interaction)
                     if status == "completed" and text.strip():
+                        self._mark_healthy(key)
                         return text, True
                     if status == "incomplete":
+                        self._mark_healthy(key)
                         return text, False
                     if status == "budget_exceeded":
                         self.exhausted_keys.add((key, self.model))
@@ -278,6 +301,8 @@ class Transcriber:
                     if use_fps and status != "budget_exceeded":
                         use_fps = self._drop_fps(last_error)
 
+                # 送出後失敗：清掉「可用」紀錄，下次用這組金鑰前重新快速檢查
+                self.healthy_until.pop((key, self.model), None)
                 # 這一輪還有其他金鑰：不等待，馬上換
                 remaining = [k for k in order[position + 1:] if (k, self.model) not in self.exhausted_keys]
                 if remaining:
@@ -292,7 +317,59 @@ class Transcriber:
                 raise QuotaExhausted(f"重試 1 次仍回傳 429：{last_error}")
             self.key_index = self._first_available_key()
 
+        if attempt == 0:
+            raise RuntimeError(f"Gemini 轉錄 {_hms(start)}–{_hms(end)}：金鑰快速檢查連續 {MAX_SEGMENT_ATTEMPTS} 輪都未通過。"
+                               f"最後錯誤：{last_error}")
         raise RuntimeError(f"Gemini 轉錄 {_hms(start)}–{_hms(end)} 重試 {attempt} 次仍失敗。最後錯誤：{last_error}")
+
+    def _mark_healthy(self, key: int) -> None:
+        self.healthy_until[(key, self.model)] = time.monotonic() + self.probe_ttl
+
+    def _probe_key(self, key: int) -> tuple[bool, str, bool]:
+        """金鑰快速檢查，回傳 (可用, 不可用的原因, 是否為額度問題)。
+
+        轉錄一段影片要 1～2 分鐘，「模型負載過高」這類錯誤常常要等到最後才回報；
+        先送一個極小的文字請求（幾秒內回應），就能提早發現：
+          - 429 額度用完／速率限制
+          - 模型負載過高（high demand、overloaded、HTTP 503）
+          - 金鑰無效或沒有權限（401／403）→ 這次執行不再使用這組金鑰
+          - 逾時（超過 probe_timeout 秒）
+        通過或剛轉錄成功的金鑰，probe_ttl 秒內不重複檢查，避免多用請求次數。
+        注意：小請求通過不代表長影片一定成功（負載可能在處理途中才滿），失敗時仍會馬上換金鑰。
+        """
+        if not self.probe_enabled or self.healthy_until.get((key, self.model), 0) > time.monotonic():
+            return True, "", False
+        started = time.monotonic()
+        try:
+            result = self.clients[key].interactions.create(
+                model=self.model,
+                input=PROBE_PROMPT,
+                generation_config={"max_output_tokens": 16},
+                store=False,
+                timeout=self.probe_timeout,
+            )
+        except Exception as exc:
+            status, message = _error_details(exc)
+            lowered = message.lower()
+            if status == 404:
+                raise  # 模型不存在：換金鑰也沒用
+            is_quota = status == 429 or (status == 403 and any(k in lowered for k in ("quota", "exhausted", "ratelimit", "rate_limit")))
+            if status in (401, 403) and not is_quota:
+                self.exhausted_keys.add((key, self.model))
+                return False, f"金鑰無效或沒有權限（HTTP {status}）：{message[:200]}", False
+            if is_quota:
+                if _is_daily_quota(message) or status == 403:
+                    self.exhausted_keys.add((key, self.model))
+                return False, f"HTTP {status}：{_quota_summary(message) or message[:200]}", True
+            if status is None:
+                return False, f"{time.monotonic() - started:.0f} 秒內沒有回應（{message[:120]}）", False
+            return False, f"HTTP {status}：{message[:200]}", False
+        status = str(getattr(result, "status", ""))
+        if status == "failed":
+            return False, f"狀態 failed：{getattr(result, 'errors', None)}", False
+        self._mark_healthy(key)
+        log.info("  金鑰 #%d 快速檢查通過（%.1f 秒）", key + 1, time.monotonic() - started)
+        return True, "", False
 
     def _drop_fps(self, message: str) -> bool:
         """帶 fps 的請求失敗後改成不帶 fps。回傳新的 use_fps（一律 False）。
@@ -331,29 +408,64 @@ class Transcriber:
         return self._stream(request)
 
     def _stream(self, request: dict) -> StreamResult:
-        """串流模式：連線保持開啟，邊接收邊累積文字，直到 interaction.completed。"""
+        """串流模式：連線保持開啟，邊接收邊累積文字，直到 interaction.completed。
+
+        長影片處理期間連線可能被伺服器或網路中途切斷（實測：約 4 分半後
+        「peer closed connection without sending complete message body」）。
+        這時用 interaction ID ＋ 最後收到的 event_id 從中斷處接續接收，
+        已收到的文字保留、不重送影片、不多用額度；接續 STREAM_RESUME_ATTEMPTS 次仍失敗才算這次失敗。
+        """
         self.stage = "串流接收結果"
-        stream = self.client.interactions.create(**request, stream=True, timeout=SEGMENT_TIMEOUT_SECONDS)
+        client = self.client
+        stream = client.interactions.create(**request, stream=True, timeout=SEGMENT_TIMEOUT_SECONDS)
         parts: list[str] = []
         completed = None
-        try:
-            for event in stream:
-                event_type = getattr(event, "event_type", None)
-                if event_type == "step.delta":
-                    delta = getattr(event, "delta", None)
-                    if getattr(delta, "type", None) == "text":
-                        parts.append(getattr(delta, "text", "") or "")
-                elif event_type == "interaction.completed":
-                    completed = getattr(event, "interaction", None)
-                elif event_type == "error":
-                    error = getattr(event, "error", None)
-                    return StreamResult(status="failed", output_text="", errors=error)
-        finally:
-            close = getattr(stream, "close", None)
-            if close:
-                close()
+        interaction_id = None
+        last_event_id = None
+        resumes = 0
+        while True:
+            disconnect = None
+            try:
+                for event in stream:
+                    event_id = getattr(event, "event_id", None)
+                    if event_id:
+                        last_event_id = event_id
+                    event_type = getattr(event, "event_type", None)
+                    if event_type == "interaction.created":
+                        interaction_id = getattr(getattr(event, "interaction", None), "id", None) or interaction_id
+                    elif event_type == "step.delta":
+                        delta = getattr(event, "delta", None)
+                        if getattr(delta, "type", None) == "text":
+                            parts.append(getattr(delta, "text", "") or "")
+                    elif event_type == "interaction.completed":
+                        completed = getattr(event, "interaction", None)
+                    elif event_type == "error":
+                        return StreamResult(status="failed", output_text="", errors=getattr(event, "error", None))
+            except Exception as exc:
+                status, message = _error_details(exc)
+                # 只有「連線中斷」（沒有 HTTP 狀態碼）而且拿得到 interaction ID 才能接續
+                if status is not None or not interaction_id or resumes >= STREAM_RESUME_ATTEMPTS:
+                    raise
+                disconnect = message
+            finally:
+                close = getattr(stream, "close", None)
+                if close:
+                    close()
+
+            if disconnect is None:
+                break
+            resumes += 1
+            log.warning("  串流連線中斷（%s），%d 秒後從中斷處接續接收（第 %d 次）",
+                        disconnect[:150], STREAM_RESUME_WAIT_SECONDS, resumes)
+            time.sleep(STREAM_RESUME_WAIT_SECONDS)
+            if last_event_id is None:
+                parts.clear()  # 還沒收到任何可定位的事件：從頭接收，避免文字重複
+            self.stage = "串流接續接收"
+            stream = client.interactions.get(id=interaction_id, stream=True, last_event_id=last_event_id,
+                                             timeout=SEGMENT_TIMEOUT_SECONDS)
+
         if completed is None:
-            raise RuntimeError("串流在收到完成事件前中斷")
+            raise RuntimeError("串流在收到完成事件前結束")
         text = "".join(parts) or _output_text(completed)
         return StreamResult(status=str(completed.status), output_text=text, usage=getattr(completed, "usage", None))
 

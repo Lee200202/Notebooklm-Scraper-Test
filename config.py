@@ -197,6 +197,11 @@ class Settings:
     gemini_api_keys: tuple[str, ...] = field(default=(), repr=False)
     youtube_api_keys: tuple[str, ...] = field(default=(), repr=False)
 
+    # 金鑰快速檢查：送影片前先用極小請求確認金鑰目前可用
+    key_probe: bool = True
+    key_probe_timeout_seconds: int = 20
+    key_probe_ttl_seconds: int = 300
+
 
 def load_settings(strict: bool = True) -> Settings:
     """strict=False 時允許 Secrets 缺漏（給 --mode check 逐項檢查用）。"""
@@ -246,4 +251,7 @@ def load_settings(strict: bool = True) -> Settings:
         smtp_port=_number("SMTP_PORT", 465, int, 1),
         gemini_api_keys=gemini_keys,
         youtube_api_keys=youtube_keys,
+        key_probe=env("KEY_PROBE", "true").lower() not in ("false", "0", "off", "no", "none"),
+        key_probe_timeout_seconds=_number("KEY_PROBE_TIMEOUT_SECONDS", 20, int, 1),
+        key_probe_ttl_seconds=_number("KEY_PROBE_TTL_SECONDS", 300, int, 0),
     )
