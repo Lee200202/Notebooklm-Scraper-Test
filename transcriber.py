@@ -106,6 +106,8 @@ class Transcriber:
         self.vocabulary = vocabulary
         # 不支援背景模式（background）的模型，例如 gemini-3.5-flash-lite：偵測到後改用串流模式
         self.stream_models: set[str] = set()
+        # (金鑰編號, 模型)：這組金鑰在這個模型的額度已用完，這次執行不再使用
+        self.exhausted_keys: set[tuple[int, str]] = set()
         self.stage = "送出請求"
 
     @property
@@ -140,26 +142,14 @@ class Transcriber:
                 text, complete = self._request(video_url, start, end)
                 break
             except QuotaExhausted as exc:
-                # 1. 若還有下一組 API Key，馬上切換（維持高品質主要模型）
-                if self.key_index + 1 < len(self.api_keys):
-                    old_idx = self.key_index
-                    self.key_index += 1
-                    log.warning("  API 金鑰 #%d 額度用完（%s），馬上切換到 API 金鑰 #%d 繼續（模型 %s）",
-                                old_idx + 1, exc, self.key_index + 1, self.model)
-                    continue
-                # 2. 所有 API Key 在目前模型的額度都用完，改用備援模型，並切換回第 1 組金鑰
-                if self.model_index + 1 < len(self.models):
-                    old_model = self.model
-                    self.model_index += 1
-                    self.key_index = 0
-                    if len(self.api_keys) > 1:
-                        log.warning("  所有 API 金鑰在 %s 的額度均已用完（%s），改用備援模型 %s 並切換回 API 金鑰 #1 繼續",
-                                    old_model, exc, self.model)
-                    else:
-                        log.warning("  %s 額度用完（%s），改用備援模型 %s 繼續", old_model, exc, self.model)
-                    continue
-                # 3. 所有金鑰與所有模型額度皆耗盡
-                raise
+                # 所有金鑰在目前模型的額度都用完：有備援模型就改用備援模型繼續
+                if self.model_index + 1 >= len(self.models):
+                    raise
+                old_model = self.model
+                self.model_index += 1
+                self.key_index = self._first_available_key()
+                log.warning("  %s 在所有金鑰的額度都用完（%s），改用備援模型 %s 繼續（金鑰 #%d）",
+                            old_model, exc, self.model, self.key_index + 1)
         if self.model not in self.models_used:
             self.models_used.append(self.model)
         key_num = self.key_index + 1
@@ -175,95 +165,134 @@ class Transcriber:
         log.info("  %s–%s 輸出被截斷，切成兩段重試", _hms(start), _hms(end))
         return self._transcribe_range(video_url, start, mid) + "\n\n" + self._transcribe_range(video_url, mid, end)
 
+    def _available_keys(self) -> list[int]:
+        return [i for i in range(len(self.api_keys)) if (i, self.model) not in self.exhausted_keys]
+
+    def _first_available_key(self) -> int:
+        keys = self._available_keys()
+        return keys[0] if keys else 0
+
     def _request(self, video_url: str, start: int, end: int) -> tuple[str, bool]:
         """送出一段影片並等待結果，回傳 (逐字稿, 是否完整)。
 
-        Gemini 讀取 YouTube 影片時可能回傳 HTTP 400「Request contains an invalid argument.」
-        （通常在輪詢結果時才出現）。實測同一個片段：
-          - 帶 fps=0.2 → 重送幾次都失敗；不帶 fps → 成功
-          - 不帶 fps 偶爾也會失敗一次，重送即可
-        所以：帶 fps 的請求失敗後，這一段改成不帶 fps 重送；其他錯誤（金鑰、權限、模型不存在除外）
-        等待後重送，最多 MAX_SEGMENT_ATTEMPTS 次。
+        失敗處理（每一段）：
+          1. 任何可重試的失敗（負載過高、400、狀態 failed、429、逾時、連線錯誤…）
+             → 不等待，馬上換下一組金鑰重送
+          2. 這一輪所有金鑰都失敗 → 等 30 秒（之後 90 秒）再從第一組可用金鑰輪一次，最多 MAX_SEGMENT_ATTEMPTS 輪
+          3. 連續兩輪所有金鑰都回 429，或錯誤訊息明確是每日額度 → 視為額度用完（QuotaExhausted），
+             由 _transcribe_range 改用備援模型（有設定時）
+          4. 401／404／非額度的 403（金鑰無效、模型不存在、沒有權限）→ 直接失敗，不重試
+
+        fps：實測帶 fps=0.2 的片段可能一直回傳 400「Request contains an invalid argument.」，
+        不帶 fps 就成功，所以帶 fps 的請求失敗後，這一段改成不帶 fps 重送。
         """
         use_fps = self.video_fps > 0
         prompt = (
             f"請聽打這段影片 {_hms(start)} 到 {_hms(end)} 的完整逐字稿。\n"
             f"可能出現的專有名詞：{'、'.join(self.vocabulary)}"
         )
+        multi_key = len(self.api_keys) > 1
+        attempt = 0
+        last_error = ""
+        quota_rounds = 0  # 連續「這一輪所有金鑰都回 429」的輪數
 
-        last_error, last_status = "", None
-        for attempt in range(1, MAX_SEGMENT_ATTEMPTS + 1):
-            if attempt > 1:
-                wait = RETRY_WAIT_SECONDS[min(attempt - 2, len(RETRY_WAIT_SECONDS) - 1)]
-                log.info("  %d 秒後重新送出", wait)
+        for round_no in range(1, MAX_SEGMENT_ATTEMPTS + 1):
+            if round_no > 1:
+                wait = RETRY_WAIT_SECONDS[min(round_no - 2, len(RETRY_WAIT_SECONDS) - 1)]
+                log.info("  %s%d 秒後重新送出", "所有金鑰這一輪都失敗，" if multi_key else "", wait)
                 time.sleep(wait)
-            processing = {"type": "static", "start_offset": f"{start}s", "end_offset": f"{end}s"}
-            if use_fps:
-                processing["fps"] = self.video_fps
-            key_tag = f"，金鑰 #{self.key_index + 1}" if len(self.api_keys) > 1 else ""
-            log.info("  Gemini 轉錄 %s–%s（第 %d 次%s%s）", _hms(start), _hms(end), attempt,
-                     f"，fps={self.video_fps}" if use_fps else "", key_tag)
 
-            request = {
-                "model": self.model,
-                "system_instruction": SYSTEM_INSTRUCTION,
-                "input": [
-                    {"type": "video", "uri": video_url, "processing": processing, "resolution": "low"},
-                    {"type": "text", "text": prompt},
-                ],
-                "generation_config": {"thinking_level": "low", "max_output_tokens": 65536},
-            }
-            try:
-                interaction = self._run(request)
-            except Exception as exc:
-                stage = self.stage
-                status, message = _error_details(exc)
-                is_quota_403 = status == 403 and any(k in message.lower() for k in ("quota", "exhausted", "ratelimit", "rate_limit"))
-                if status in NON_RETRYABLE_STATUS and not is_quota_403:
-                    raise
-                if status == 429 or is_quota_403:
-                    # 完整印出是哪一種額度（每日請求數、每分鐘 token 數…），方便判斷
-                    detail = _quota_summary(message) or message[:300]
-                    if _is_daily_quota(message) or is_quota_403:
-                        raise QuotaExhausted(f"每日額度已用完：{detail}") from exc
-                    # 重試 1 次仍回傳 429 就換鑰匙（第 1 次失敗等待重送，第 2 次仍 429 即判定額度耗盡換金鑰）
-                    if attempt >= 2:
-                        raise QuotaExhausted(f"重試 1 次仍回傳 429：{detail}") from exc
+            keys = self._available_keys()
+            if not keys:
+                raise QuotaExhausted(f"所有金鑰在 {self.model} 的額度都已用完：{last_error}")
+            # 從目前使用中的金鑰開始輪（上一段成功的金鑰優先）
+            first = keys.index(self.key_index) if self.key_index in keys else 0
+            order = keys[first:] + keys[:first]
+
+            all_quota = True
+            for position, key in enumerate(order):
+                if (key, self.model) in self.exhausted_keys:
+                    continue
+                self.key_index = key
+                attempt += 1
+                key_tag = f"，金鑰 #{key + 1}" if multi_key else ""
+                processing = {"type": "static", "start_offset": f"{start}s", "end_offset": f"{end}s"}
+                if use_fps:
+                    processing["fps"] = self.video_fps
+                log.info("  Gemini 轉錄 %s–%s（第 %d 次%s%s）", _hms(start), _hms(end), attempt,
+                         f"，fps={self.video_fps}" if use_fps else "", key_tag)
+                request = {
+                    "model": self.model,
+                    "system_instruction": SYSTEM_INSTRUCTION,
+                    "input": [
+                        {"type": "video", "uri": video_url, "processing": processing, "resolution": "low"},
+                        {"type": "text", "text": prompt},
+                    ],
+                    "generation_config": {"thinking_level": "low", "max_output_tokens": 65536},
+                }
+
+                try:
+                    interaction = self._run(request)
+                except Exception as exc:
+                    stage = self.stage
+                    status, message = _error_details(exc)
+                    lowered = message.lower()
+                    is_quota_403 = status == 403 and any(k in lowered for k in ("quota", "exhausted", "ratelimit", "rate_limit"))
+                    if status in NON_RETRYABLE_STATUS and not is_quota_403:
+                        raise
+                    if status == 429 or is_quota_403:
+                        # 完整印出是哪一種額度（每日請求數、每分鐘 token 數…），方便判斷
+                        detail = _quota_summary(message) or message[:300]
+                        if _is_daily_quota(message) or is_quota_403:
+                            self.exhausted_keys.add((key, self.model))
+                    else:
+                        detail = message[:300]
+                        all_quota = False
+                    last_error = f"{stage}時發生錯誤（HTTP {status}，模型 {self.model}{key_tag}）：{detail}"
+                    log.warning("  %s", last_error)
+                    if status == 400 and use_fps:
+                        use_fps = self._drop_fps(message)
                 else:
-                    detail = message[:300]
-                last_error, last_status = f"{stage}時發生錯誤（HTTP {status}，模型 {self.model}）：{detail}", status
-                log.warning("  %s", last_error)
-                if status == 400 and use_fps:
-                    use_fps = self._drop_fps(message)
-                continue
+                    usage = getattr(interaction, "usage", None)
+                    if usage:
+                        log.info(
+                            "  token 用量：輸入 %s／輸出 %s／思考 %s",
+                            usage.total_input_tokens, usage.total_output_tokens, usage.total_thought_tokens,
+                        )
+                    status = str(interaction.status)
+                    text = _output_text(interaction)
+                    if status == "completed" and text.strip():
+                        return text, True
+                    if status == "incomplete":
+                        return text, False
+                    if status == "budget_exceeded":
+                        self.exhausted_keys.add((key, self.model))
+                        last_error = f"金鑰 #{key + 1} 已達 Gemini 帳單的支出上限"
+                    else:
+                        all_quota = False
+                        last_error = (
+                            f"Gemini 回傳空白逐字稿（模型 {self.model}{key_tag}）" if status == "completed"
+                            else f"Gemini 回傳狀態 {status}（模型 {self.model}{key_tag}）：{getattr(interaction, 'errors', None)}"
+                        )
+                    log.warning("  %s", last_error)
+                    if use_fps and status != "budget_exceeded":
+                        use_fps = self._drop_fps(last_error)
 
-            usage = getattr(interaction, "usage", None)
-            if usage:
-                log.info(
-                    "  token 用量：輸入 %s／輸出 %s／思考 %s",
-                    usage.total_input_tokens, usage.total_output_tokens, usage.total_thought_tokens,
-                )
-            status = str(interaction.status)
-            text = _output_text(interaction)
-            if status == "completed" and text.strip():
-                return text, True
-            if status == "incomplete":
-                return text, False
-            if status == "budget_exceeded":
-                raise QuotaExhausted("已達 Gemini 帳單的支出上限，請到 AI Studio 調整上限")
-            last_error = (
-                "Gemini 回傳空白逐字稿" if status == "completed"
-                else f"Gemini 回傳狀態 {status}：{getattr(interaction, 'errors', None)}"
-            )
-            last_status = None
-            log.warning("  %s", last_error)
-            if use_fps:
-                use_fps = self._drop_fps(last_error)
+                # 這一輪還有其他金鑰：不等待，馬上換
+                remaining = [k for k in order[position + 1:] if (k, self.model) not in self.exhausted_keys]
+                if remaining:
+                    log.warning("  金鑰 #%d 失敗，馬上改用金鑰 #%d 重送", key + 1, remaining[0] + 1)
 
-        if last_status == 429:
-            # 每分鐘額度在等待後應已恢復；仍然 429 代表是每日（或更長週期）的額度
-            raise QuotaExhausted(f"重試 1 次仍回傳 429：{last_error}")
-        raise RuntimeError(f"Gemini 轉錄 {_hms(start)}–{_hms(end)} 重試 {MAX_SEGMENT_ATTEMPTS} 次仍失敗。最後錯誤：{last_error}")
+            # 這一輪所有金鑰都失敗了
+            if not self._available_keys():
+                raise QuotaExhausted(f"所有金鑰在 {self.model} 的額度都已用完：{last_error}")
+            quota_rounds = quota_rounds + 1 if all_quota else 0
+            if quota_rounds >= 2:
+                # 等待後重試仍全部 429：不是每分鐘限制，而是每日（或更長週期）的額度
+                raise QuotaExhausted(f"重試 1 次仍回傳 429：{last_error}")
+            self.key_index = self._first_available_key()
+
+        raise RuntimeError(f"Gemini 轉錄 {_hms(start)}–{_hms(end)} 重試 {attempt} 次仍失敗。最後錯誤：{last_error}")
 
     def _drop_fps(self, message: str) -> bool:
         """帶 fps 的請求失敗後改成不帶 fps。回傳新的 use_fps（一律 False）。

@@ -54,6 +54,7 @@ class FakeGemini(BaseHTTPRequestHandler):
     final_status = staticmethod(lambda index: "completed")  # 第 index 個請求的最終狀態
     post_error = staticmethod(lambda call_no, body: None)    # 回傳 (HTTP 狀態碼, JSON) 模擬送出失敗
     no_background_models: set = set()                        # 不支援背景模式的模型（只能用串流）
+    stream_error = staticmethod(lambda processing, api_key: None)  # 回傳串流 error 事件（dict）模擬處理失敗
     poll_error = staticmethod(lambda index, count: None)     # 回傳 (HTTP 狀態碼, JSON) 模擬輪詢失敗
 
     def log_message(self, *args):
@@ -87,15 +88,16 @@ class FakeGemini(BaseHTTPRequestHandler):
                 "message": f"Model '{body['model']}' does not support background interactions.", "code": "invalid_request"}})
         if body.get("stream"):
             cls.requests.append(body)
-            return self._send_stream(video["processing"])
+            return self._send_stream(video["processing"], cls.stream_error(video["processing"], body["_api_key"]))
         cls.requests.append(body)
         interaction_id = f"int-{len(cls.requests)}"
         cls.polls[interaction_id] = {"count": 0, "index": len(cls.requests) - 1, "processing": video["processing"]}
         self._send(200, {"id": interaction_id, "status": "in_progress"})
 
-    def _send_stream(self, processing):
+    def _send_stream(self, processing, error_event=None):
         text = f"{processing['start_offset']}-{processing['end_offset']} 台積電 2330 漲 3.5%。"
-        events = [
+        events = [{"event_type": "interaction.created", "interaction": {"id": "stream-1", "status": "in_progress"}},
+                  error_event] if error_event else [
             {"event_type": "interaction.created", "interaction": {"id": "stream-1", "status": "in_progress"}},
             {"event_type": "step.delta", "index": 0, "delta": {"type": "text", "text": text[:10]}},
             {"event_type": "step.delta", "index": 0, "delta": {"type": "text", "text": text[10:]}},
@@ -253,6 +255,7 @@ class PipelineTest(unittest.TestCase):
         FakeGemini.poll_error = staticmethod(lambda index, count: None)
         FakeSMTP.sent, FakeSMTP.logins, FakeSMTP.fail_login = [], [], False
         FakeGemini.no_background_models = set()
+        FakeGemini.stream_error = staticmethod(lambda processing, api_key: None)
         self.book = FakeSpreadsheet()
         self.videos = {}
         self.today = datetime.now(TAIPEI).date()
@@ -561,8 +564,7 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual([r["model"] for r in FakeGemini.requests], [MODEL] * 3)  # 全程都是主要模型
         self.assertEqual(self.rows()[0][9], MODEL)  # 「模型」欄位仍是主要模型
         warnings = " | ".join(transcriber_logs.output)
-        self.assertIn("API 金鑰 #1 額度用完", warnings)
-        self.assertIn("馬上切換到 API 金鑰 #2 繼續", warnings)
+        self.assertIn("金鑰 #1 失敗，馬上改用金鑰 #2 重送", warnings)
         # 驗證被接受的請求中包含 key-1 與 key-2
         api_keys_used = [r.get("_api_key") for r in FakeGemini.requests]
         self.assertEqual(api_keys_used, ["key-1", "key-2", "key-2"])
@@ -579,7 +581,9 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([r["model"] for r in FakeGemini.requests], [FALLBACK] * 3)
         warnings = " | ".join(transcriber_logs.output)
-        self.assertIn(f"所有 API 金鑰在 {MODEL} 的額度均已用完", warnings)
+        # 第 1 輪：金鑰 #1、#2 都 429 → 等待後第 2 輪仍都 429 → 判定額度用完 → 改用備援模型
+        self.assertEqual(warnings.count("馬上改用金鑰 #2 重送"), 2)
+        self.assertIn(f"{MODEL} 在所有金鑰的額度都用完", warnings)
         self.assertIn(f"改用備援模型 {FALLBACK}", warnings)
 
     def test_youtube_client_multi_key_rotation(self):
@@ -624,8 +628,8 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(self.log_results(), ["設定檢查通過"])
         self.assertEqual(FakeGemini.requests, [])  # 檢查不會用掉生成額度
 
-    def test_retry_once_429_immediately_switches_key(self):
-        # 驗證「重試 1 次仍回傳 429 就換鑰匙」：Key 1 遇到 429 後重試 1 次（共 2 次），仍 429 則立刻換 Key 2，不嘗試第 3 次
+    def test_first_429_immediately_switches_key_without_waiting(self):
+        # 第一次失敗就馬上換下一組金鑰，不等待、不在同一組金鑰重試
         self.set_channel(count=1)
         key1_calls = 0
 
@@ -641,12 +645,48 @@ class PipelineTest(unittest.TestCase):
                 self.assertLogs("transcriber", level="WARNING") as transcriber_logs:
             code, _ = self.run_main("--video-id", TODAY)
         self.assertEqual(code, 0)
-        # Key 1 只能有 2 次嘗試（初次 + 1 次重試），不能有第 3 次
-        self.assertEqual(key1_calls, 2)
+        # 第 1 段：金鑰 #1 失敗 1 次就換 #2；之後的片段沿用成功的金鑰 #2，不再回頭試 #1
+        self.assertEqual(key1_calls, 1)
+        self.assertEqual([r.get("_api_key") for r in FakeGemini.requests], ["key-2"] * 3)
         warnings = " | ".join(transcriber_logs.output)
-        self.assertIn("API 金鑰 #1 額度用完", warnings)
-        self.assertIn("重試 1 次仍回傳 429", warnings)
-        self.assertIn("馬上切換到 API 金鑰 #2 繼續", warnings)
+        self.assertIn("金鑰 #1 失敗，馬上改用金鑰 #2 重送", warnings)
+        self.assertNotIn("秒後重新送出", warnings)
+
+    def test_high_demand_failure_immediately_switches_key(self):
+        # 重現 GitHub 上的情況：串流回傳 failed「currently experiencing high demand」→ 馬上換金鑰，不等 30 秒
+        self.set_channel(count=1)
+        FakeGemini.no_background_models = {MODEL}
+
+        def high_demand_stream(processing, api_key):
+            if api_key == "key-1":
+                return {"event_type": "error", "error": {
+                    "code": "api_error",
+                    "message": f"{MODEL} is currently experiencing high demand, spikes in demand are usually temporary. "
+                               "Please try again later."}}
+            return None
+
+        FakeGemini.stream_error = staticmethod(high_demand_stream)
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "key-1", "GEMINI_API_KEY_2": "key-2"}), \
+                self.assertLogs("transcriber", level="INFO") as transcriber_logs:
+            code, _ = self.run_main("--video-id", TODAY)
+        self.assertEqual(code, 0)
+        logs = " | ".join(transcriber_logs.output)
+        self.assertIn("high demand", logs)
+        self.assertIn("金鑰 #1 失敗，馬上改用金鑰 #2 重送", logs)
+        self.assertNotIn("秒後重新送出", logs)
+        self.assertEqual([r.get("_api_key") for r in FakeGemini.requests], ["key-1", "key-2", "key-2", "key-2"])
+        self.assertEqual(self.rows()[0][3], TODAY)
+
+    def test_all_keys_failing_waits_then_retries_round(self):
+        # 所有金鑰這一輪都失敗 → 等 30 秒再從第一組輪一次
+        self.set_channel(count=1)
+        FakeGemini.final_status = staticmethod(lambda index: "failed" if index < 2 else "completed")
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "key-1", "GEMINI_API_KEY_2": "key-2"}), \
+                self.assertLogs("transcriber", level="INFO") as transcriber_logs:
+            code, _ = self.run_main("--video-id", TODAY)
+        self.assertEqual(code, 0)
+        self.assertEqual([r.get("_api_key") for r in FakeGemini.requests][:3], ["key-1", "key-2", "key-1"])
+        self.assertIn("所有金鑰這一輪都失敗，30 秒後重新送出", " | ".join(transcriber_logs.output))
 
     def test_check_mode_lists_all_missing_secrets(self):
         self.set_channel()
