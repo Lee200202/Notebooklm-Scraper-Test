@@ -8,6 +8,10 @@ on:
     # 台灣時間 週一～週五 12:00～13:55，直播延長或 YouTube 處理較慢時的緩衝
     - cron: "*/5 12-13 * * 1-5"
       timezone: "Asia/Taipei"
+    # 台灣時間 週一～週五 15:10、15:40、16:10、16:40：Gemini 每日額度在太平洋時間午夜重置
+    # （台灣 15:00，美國冬令時間期間為 16:00），萬一早上因額度不足失敗，重置後再補一次
+    - cron: "10,40 15-16 * * 1-5"
+      timezone: "Asia/Taipei"
   workflow_dispatch:
     inputs:
       mode:
@@ -54,6 +58,7 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           # ---- Variables（選填，沒設定就用程式預設值）----
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          GEMINI_FALLBACK_MODEL: ${{ vars.GEMINI_FALLBACK_MODEL }}
           SEGMENT_MINUTES: ${{ vars.SEGMENT_MINUTES }}
           VIDEO_FPS: ${{ vars.VIDEO_FPS }}
           INIT_VIDEO_COUNT: ${{ vars.INIT_VIDEO_COUNT }}

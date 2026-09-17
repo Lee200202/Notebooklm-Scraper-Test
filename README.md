@@ -6,11 +6,11 @@
 **全部在網頁上完成**：程式跑在 GitHub，金鑰放在 GitHub Secrets，Google 的設定在瀏覽器裡的 Cloud Shell 做。不需要在自己電腦安裝任何東西。
 
 ```
-GitHub Actions 排程（週一～五 11:20–13:55，每 5 分鐘）
+GitHub Actions 排程（週一～五 11:20–13:55 每 5 分鐘；另在額度重置後 15:10–16:40 補跑）
    │
    ├─ YouTube Data API：今天的直播結束了嗎？ ── 還沒 → 結束，5 分鐘後再查
    ├─ Google 試算表：今天這集寫過了嗎？      ── 寫過 → 結束
-   ├─ Gemini API（gemini-3.8-flash）：直接讀 YouTube 網址，每 30 分鐘切一段聽打
+   ├─ Gemini API（gemini-3.8-flash，額度用完改用 gemini-3.5-flash-lite）：直接讀 YouTube 網址，每 30 分鐘切一段聽打
    └─ 寫入試算表「逐字稿」＋「執行紀錄」
 ```
 
@@ -23,7 +23,7 @@ GitHub Actions 排程（週一～五 11:20–13:55，每 5 分鐘）
 
 1. **Public 或 Private repo 的差別**：
    - **Public**：任何人都看得到程式碼和 Actions 的 log，Actions 分鐘數不限。但如果連續 60 天沒有任何活動（例如 commit），GitHub 會自動停用排程，停用後到 Actions 頁面按「Enable workflow」就能恢復。
-   - **Private**：只有你看得到，也沒有 60 天規則，但 Actions 每月只有 2,000 分鐘免費額度（本專案每月約用 700～900 分鐘）。
+   - **Private**：只有你看得到，也沒有 60 天規則，但 Actions 每月只有 2,000 分鐘免費額度（本專案每月約用 800～1,000 分鐘）。
    - 不論哪一種，程式都**不會**把金鑰或逐字稿內容印到 log，服務帳戶 email 會自動遮蔽成 `***`；逐字稿只存在你自己的試算表。
 2. **排程時間不一定準**：GitHub 排程在尖峰時段可能延遲或跳過某一次，詳見下方「日常運作」。
 3. **GitHub 使用條款**：GitHub 的條款寫明，GitHub 主機上的 Actions 應該用在「軟體專案的開發、測試、部署」相關工作。
@@ -170,6 +170,7 @@ bash setup.sh
 | 時間（台灣） | 行為 |
 |---|---|
 | 平日 11:20～13:55，每 5 分鐘 | 檢查今天的直播：還在直播、剛結束或 YouTube 還在處理 → 結束，等下次 |
+| 平日 15:10、15:40、16:10、16:40 | Gemini 每日額度重置後再檢查一次；今天那集已完成就直接結束 |
 | 直播結束滿 5 分鐘後的第一次排程 | 開始轉錄並寫入試算表，當天剩下的排程只會檢查就結束 |
 | 轉錄失敗 | 記錄到「執行紀錄」，GitHub 寄失敗通知 email；下次排程重試，排程觸發時同一集一天最多失敗 3 次（手動執行不受限） |
 | 假日、休市沒直播 | 找不到當天影片，直接結束，不算錯誤 |
@@ -197,7 +198,8 @@ bash setup.sh
 
 | Name | 預設 | 說明 |
 |---|---|---|
-| `GEMINI_MODEL` | `gemini-3.8-flash` | 想更省錢可以改成 `gemini-3.5-flash-lite` |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | 主要模型。想全部用便宜的模型可以改成 `gemini-3.5-flash-lite` |
+| `GEMINI_FALLBACK_MODEL` | `gemini-3.5-flash-lite` | 主要模型額度用完時改用的模型；設成 `none` 則不使用備援 |
 | `SEGMENT_MINUTES` | `30` | 每段長度（至少 5）。改小聽打會更完整，但請求次數會增加 |
 | `VIDEO_FPS` | `0`（不指定） | 畫面取樣率。**建議不要設定**：實測設 `0.2` 可省約 6 成 token，但部分影片片段會一直回傳 400 錯誤（設定後程式遇到失敗會自動改成不帶 fps 重送，但會多用請求次數） |
 | `INIT_VIDEO_COUNT` | `5` | init 補抓幾集 |
@@ -213,15 +215,22 @@ bash setup.sh
 
 | 服務 | 用量 | 費用 |
 |---|---|---|
-| Gemini API（免費方案） | 每集約 3 次請求 | gemini-3.8-flash 免費方案每天約 20 次請求、YouTube 影片每天 8 小時，每天 1 集綽綽有餘 |
-| Gemini API（付費方案） | 每集約 33～39 萬輸入 token（每 30 分鐘約 16.4 萬）、1 萬輸出 token | 依 2026 年牌價估算約 US$0.3／集，2027 年起價格加倍 |
+| Gemini API（免費方案） | 每集約 3 次請求（每 30 分鐘一段） | gemini-3.8-flash 每天約 20 次；額度用完自動改用 gemini-3.5-flash-lite（另一份額度） |
+| Gemini API（付費方案） | 每集約 33～39 萬輸入 token、1 萬輸出 token | 依 2026 年牌價估算：gemini-3.8-flash 約 US$0.3／集、gemini-3.5-flash-lite 約 US$0.13／集 |
 | YouTube Data API | 每次檢查 3 單位，每天約 100 單位 | 免費（每天上限 10,000） |
 | Google Sheets API | 很少 | 免費 |
-| GitHub Actions | 每天約 32 次，每次約 1 分鐘 | 公開 repo 免費；Private repo 算在每月 2,000 分鐘內 |
+| GitHub Actions | 每天約 36 次，每次約 1 分鐘 | 公開 repo 免費；Private repo 算在每月 2,000 分鐘內 |
 
-- 實際額度以 [AI Studio 額度頁面](https://aistudio.google.com/rate-limit) 為準
-- 免費方案的輸入內容可能會被 Google 用來改善產品，付費方案不會
-- Gemini 每日額度在太平洋時間午夜重置，約台灣時間 15:00～16:00。額度用完時，程式會記錄「配額不足」並停止；等重置後手動執行 `init` 補抓
+**Gemini 額度的重點**
+
+- **額度按「專案＋模型」計算，不是按 API 金鑰**：同一個專案建立再多把金鑰，額度都一樣。不同模型各有一份額度，所以主要模型用完時，程式會自動改用備援模型（預設 `gemini-3.5-flash-lite`），不用等隔天。
+- **每日額度在太平洋時間午夜重置，也就是台灣時間 15:00（美國冬令時間期間是 16:00），不是台灣午夜**。
+  - 例如：晚上手動補抓用掉的額度，和**隔天早上 11:20 的排程**算在同一天。
+  - 所以排程在 15:10～16:40 另外加跑 4 次，早上因額度不足沒抓到的話，重置後會自動補。
+- 真的需要更多額度：在 AI Studio 替專案[綁定帳單](https://aistudio.google.com/projects)（Tier 1），額度會提高很多；依上表估算，每月 22 集約 US$3～7。
+- 不建議開多個 Google Cloud 專案、輪流用各專案的金鑰來疊加免費額度。[Google APIs 服務條款](https://developers.google.com/terms)規定不得規避 API 的使用限制，違反可能導致專案或帳號被停權。
+- 實際額度以 [AI Studio 額度頁面](https://aistudio.google.com/rate-limit) 為準（可以切換模型查看）。
+- 免費方案的輸入內容可能會被 Google 用來改善產品，付費方案不會。
 
 ## 常見問題
 
@@ -258,6 +267,11 @@ base64 -w0 key.json; echo; rm -f key.json
 
 **Q：log 的時間是哪個時區？**
 程式印出的時間是台灣時間。GitHub 介面左側另外顯示的時間戳記則是 UTC。
+
+**Q：log 出現「HTTP 429 … You exceeded your current quota」？**
+表示 Gemini 額度用完。log 會印出是哪一種額度，例如 `generate_content_free_tier_requests, limit: 20, model: gemini-3.8-flash` 就是該模型的每日請求數。
+程式會等 30 秒、90 秒重試；仍然 429 就改用備援模型繼續。備援模型也用完，就記錄「配額不足」並停止，等 15:00 或 16:00 額度重置後的排程補跑。
+「模型」欄會記錄這集實際用了哪些模型，例如 `gemini-3.8-flash + gemini-3.5-flash-lite`。
 
 **Q：逐字稿有漏段或變成摘要？**
 把 Variable `SEGMENT_MINUTES` 設成 `15`，每段越短越不容易漏，代價是請求次數加倍。

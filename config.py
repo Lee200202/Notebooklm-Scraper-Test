@@ -65,6 +65,11 @@ def _number(name: str, default, cast, minimum):
     return value
 
 
+def _fallback_model() -> str:
+    value = env("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
+    return "" if value.lower() in ("none", "off", "false", "0", "-") else value
+
+
 def missing_secrets() -> list[str]:
     return [name for name in REQUIRED_SECRETS if not env(name)]
 
@@ -119,6 +124,7 @@ class Settings:
 
     gemini_api_key: str = field(repr=False)
     gemini_model: str
+    gemini_fallback_model: str  # 空字串 = 不使用備援模型
     segment_minutes: int
     video_fps: float
     vocabulary: tuple[str, ...]
@@ -143,6 +149,9 @@ def load_settings(strict: bool = True) -> Settings:
         ready_delay_minutes=_number("READY_DELAY_MINUTES", 5, int, 0),
         gemini_api_key=env("GEMINI_API_KEY"),
         gemini_model=env("GEMINI_MODEL", "gemini-3.8-flash"),
+        # 主要模型額度用完時改用的模型。額度按模型分開計算，flash-lite 免費額度較多、也比較便宜。
+        # 設成 none 可停用備援
+        gemini_fallback_model=_fallback_model(),
         # 每段送給 Gemini 的影片長度；免費方案每天約 20 次請求，30 分鐘一段最省
         segment_minutes=_number("SEGMENT_MINUTES", 30, int, 5),
         # 預設 0 = 不指定 fps（API 預設每秒 1 張畫面）。實測 fps=0.2 雖然省 token，

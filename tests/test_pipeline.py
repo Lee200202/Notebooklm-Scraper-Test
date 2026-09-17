@@ -28,6 +28,7 @@ import youtube_client  # noqa: E402
 from config import TAIPEI, ConfigError  # noqa: E402
 
 MODEL = "gemini-3.8-flash"
+FALLBACK = "gemini-3.5-flash-lite"
 TODAY = "todayVideo1"  # YouTube 影片 ID 固定 11 碼
 SERVICE_ACCOUNT = {
     "type": "service_account",
@@ -47,7 +48,7 @@ class FakeGemini(BaseHTTPRequestHandler):
     reject_fps = False
     daily_quota = False
     final_status = staticmethod(lambda index: "completed")  # 第 index 個請求的最終狀態
-    post_error = staticmethod(lambda call_no: None)          # 回傳 (HTTP 狀態碼, JSON) 模擬送出失敗
+    post_error = staticmethod(lambda call_no, body: None)    # 回傳 (HTTP 狀態碼, JSON) 模擬送出失敗
     poll_error = staticmethod(lambda index, count: None)     # 回傳 (HTTP 狀態碼, JSON) 模擬輪詢失敗
 
     def log_message(self, *args):
@@ -65,7 +66,7 @@ class FakeGemini(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         cls = type(self)
         cls.post_calls += 1
-        error = cls.post_error(cls.post_calls)
+        error = cls.post_error(cls.post_calls, body)
         if error:
             return self._send(*error)
         if cls.daily_quota:
@@ -169,6 +170,12 @@ def old(i):
 
 
 INVALID_ARGUMENT = (400, {"error": {"message": "Request contains an invalid argument.", "code": "invalid_request"}})
+# 實際在 GitHub 上收到的 429 訊息格式
+QUOTA_EXCEEDED = (429, {"error": {"code": "resource_exhausted", "message": (
+    "You exceeded your current quota, please check your plan and billing details. For more information on this error, "
+    "head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, head to: "
+    "https://ai.dev/rate-limit. \n* Quota exceeded for metric: generativelanguage.googleapis.com/"
+    "generate_content_free_tier_requests, limit: 20, model: gemini-3.8-flash\nPlease retry in 41.3s.")}})
 
 
 def processing_of(request):
@@ -189,7 +196,7 @@ class PipelineTest(unittest.TestCase):
         FakeGemini.requests, FakeGemini.polls, FakeGemini.post_calls = [], {}, 0
         FakeGemini.reject_fps = FakeGemini.daily_quota = False
         FakeGemini.final_status = staticmethod(lambda index: "completed")
-        FakeGemini.post_error = staticmethod(lambda call_no: None)
+        FakeGemini.post_error = staticmethod(lambda call_no, body: None)
         FakeGemini.poll_error = staticmethod(lambda index, count: None)
         self.book = FakeSpreadsheet()
         self.videos = {}
@@ -408,18 +415,45 @@ class PipelineTest(unittest.TestCase):
 
     def test_not_found_model_is_not_retried(self):
         self.set_channel(count=1)
-        FakeGemini.post_error = staticmethod(lambda call_no: (404, {"error": {"message": "model not found", "code": "not_found"}}))
+        FakeGemini.post_error = staticmethod(lambda call_no, body: (404, {"error": {"message": "model not found", "code": "not_found"}}))
         self.assertEqual(self.run_main("--video-id", TODAY)[0], 1)
         self.assertEqual(FakeGemini.post_calls, 1)
 
-    def test_persistent_429_without_quota_details_counts_as_quota(self):
-        # 新版錯誤格式可能沒有 quotaId 等細節；持續 429 仍要判定為額度用完並停止
+    def test_quota_summary_extracts_metric_limit_and_model(self):
+        message = str(QUOTA_EXCEEDED[1])
+        self.assertEqual(transcriber._quota_summary(message),
+                         "generate_content_free_tier_requests, limit: 20, model: gemini-3.8-flash")
+        self.assertFalse(transcriber._is_daily_quota(message))  # 訊息裡沒有 per day 字樣，只能靠持續 429 判斷
+
+    def test_primary_quota_exhausted_switches_to_fallback_model(self):
+        # 重現 GitHub 上的情況：第一段成功後主要模型額度用完 → 改用 flash-lite 完成剩下的片段與影片
+        self.set_channel(count=2)
+        FakeGemini.post_error = staticmethod(
+            lambda call_no, body: QUOTA_EXCEEDED if body["model"] == MODEL and call_no > 1 else None)
+        with self.assertLogs("transcriber", level="WARNING") as transcriber_logs:
+            code, _ = self.run_main("--mode", "init")
+        self.assertEqual(code, 0)
+        self.assertEqual([r["model"] for r in FakeGemini.requests], [MODEL] + [FALLBACK] * 5)
+        self.assertEqual([r[9] for r in self.rows()], [f"{MODEL} + {FALLBACK}", FALLBACK])  # 「模型」欄
+        warnings = " | ".join(transcriber_logs.output)
+        self.assertIn("改用備援模型 gemini-3.5-flash-lite", warnings)
+        self.assertIn("limit: 20, model: gemini-3.8-flash", warnings)  # 完整印出是哪一種額度
+
+    def test_all_models_exhausted_stops_the_run(self):
         self.set_channel()
-        exhausted = (429, {"error": {"message": "Resource has been exhausted.", "code": "resource_exhausted"}})
-        FakeGemini.post_error = staticmethod(lambda call_no: exhausted)
+        FakeGemini.post_error = staticmethod(lambda call_no, body: QUOTA_EXCEEDED)
         self.assertEqual(self.run_main("--mode", "init")[0], 1)
         self.assertEqual(self.log_results(), ["配額不足"])  # 只記一次，後面的影片不再嘗試
+        self.assertIn(f"{MODEL} / {FALLBACK}", self.book.sheets["執行紀錄"].rows[-1][5])
         self.assertEqual(self.rows(), [])
+
+    def test_fallback_model_can_be_disabled(self):
+        self.set_channel(count=1)
+        FakeGemini.post_error = staticmethod(lambda call_no, body: QUOTA_EXCEEDED)
+        with mock.patch.dict(os.environ, {"GEMINI_FALLBACK_MODEL": "none"}):
+            self.assertEqual(self.run_main("--video-id", TODAY)[0], 1)
+        self.assertEqual(self.log_results(), ["配額不足"])
+        self.assertNotIn(FALLBACK, self.book.sheets["執行紀錄"].rows[-1][5])
 
     def test_daily_quota_stops_remaining_videos(self):
         self.set_channel()
@@ -445,6 +479,8 @@ class PipelineTest(unittest.TestCase):
             code = main.main(["--mode", "check"])
         self.assertEqual(code, 0, out.getvalue())
         self.assertEqual(out.getvalue().count("✅"), 4)
+        self.assertIn(f"主要模型 {MODEL}", out.getvalue())
+        self.assertIn(f"備援模型 {FALLBACK}", out.getvalue())
         self.assertEqual(self.log_results(), ["設定檢查通過"])
         self.assertEqual(FakeGemini.requests, [])  # 檢查不會用掉生成額度
 

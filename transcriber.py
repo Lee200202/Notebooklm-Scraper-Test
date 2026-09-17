@@ -5,6 +5,7 @@ Gemini 會自己「聽」影片的聲音來聽打。
 長影片切成數段（start_offset / end_offset）分別送出，避免超過單次輸出上限。
 """
 import logging
+import re
 import time
 
 from google import genai
@@ -52,25 +53,44 @@ def _error_details(exc: Exception) -> tuple[int | None, str]:
     return status, str(body) if body else f"{type(exc).__name__}: {exc}"
 
 
+def _quota_summary(message: str) -> str:
+    """從 429 錯誤訊息擷取「哪一種額度、上限多少、哪個模型」，例如
+    generate_content_free_tier_requests, limit: 20, model: gemini-3.8-flash"""
+    found = re.findall(r"Quota exceeded for metric: (?:[\w.-]+/)?([\w.-]+), limit: (\d+)(?:, model: ([\w.-]+))?", message)
+    return "；".join(f"{metric}, limit: {limit}" + (f", model: {model}" if model else "") for metric, limit, model in found)
+
+
 def _is_daily_quota(message: str) -> bool:
     lowered = message.lower()
     return any(k in lowered for k in ("perday", "per day", "per_day", "daily"))
 
 
 class Transcriber:
-    def __init__(self, api_key: str, model: str, segment_minutes: int, video_fps: float, vocabulary: tuple[str, ...]):
+    def __init__(self, api_key: str, model: str, segment_minutes: int, video_fps: float, vocabulary: tuple[str, ...],
+                 fallback_model: str = ""):
         self.client = genai.Client(api_key=api_key)
-        self.model = model
+        # 額度是「每個模型分開計算」：主要模型額度用完時，改用備援模型繼續
+        self.models = [model] + ([fallback_model] if fallback_model and fallback_model != model else [])
+        self.model_index = 0
+        self.models_used: list[str] = []  # 目前這集實際用到的模型（寫入試算表「模型」欄）
         self.segment_seconds = segment_minutes * 60
         self.video_fps = video_fps
         self.vocabulary = vocabulary
 
-    def check_model(self) -> str:
+    @property
+    def model(self) -> str:
+        return self.models[self.model_index]
+
+    def check_models(self) -> list[str]:
         """確認金鑰有效、模型名稱存在。只讀取模型資訊，不會用掉生成請求的額度。"""
-        model = self.client.models.get(model=self.model)
-        return getattr(model, "display_name", None) or self.model
+        names = []
+        for name in self.models:
+            info = self.client.models.get(model=name)
+            names.append(f"{name}（{getattr(info, 'display_name', None) or name}）")
+        return names
 
     def transcribe(self, video_url: str, duration_sec: int) -> str:
+        self.models_used = []
         sections = []
         for start in range(0, duration_sec, self.segment_seconds):
             end = min(start + self.segment_seconds, duration_sec)
@@ -79,7 +99,17 @@ class Transcriber:
         return "\n\n".join(sections)
 
     def _transcribe_range(self, video_url: str, start: int, end: int) -> str:
-        text, complete = self._request(video_url, start, end)
+        while True:
+            try:
+                text, complete = self._request(video_url, start, end)
+                break
+            except QuotaExhausted as exc:
+                if self.model_index + 1 >= len(self.models):
+                    raise
+                log.warning("  %s 額度用完（%s），改用備援模型 %s 繼續", self.model, exc, self.models[self.model_index + 1])
+                self.model_index += 1  # 這次執行後面的片段、影片都用備援模型
+        if self.model not in self.models_used:
+            self.models_used.append(self.model)
         if complete:
             return text
         if end - start < MIN_SPLIT_SECONDS * 2:
@@ -137,9 +167,14 @@ class Transcriber:
                 status, message = _error_details(exc)
                 if status in NON_RETRYABLE_STATUS:
                     raise
-                if status == 429 and _is_daily_quota(message):
-                    raise QuotaExhausted(f"Gemini 每日額度已用完：{message[:300]}") from exc
-                last_error, last_status = f"{stage}時發生錯誤（HTTP {status}）：{message[:300]}", status
+                if status == 429:
+                    # 完整印出是哪一種額度（每日請求數、每分鐘 token 數…），方便判斷
+                    detail = _quota_summary(message) or message[:300]
+                    if _is_daily_quota(message):
+                        raise QuotaExhausted(f"每日額度已用完：{detail}") from exc
+                else:
+                    detail = message[:300]
+                last_error, last_status = f"{stage}時發生錯誤（HTTP {status}，模型 {self.model}）：{detail}", status
                 log.warning("  %s", last_error)
                 if status == 400 and use_fps:
                     use_fps = self._drop_fps(message)
@@ -170,7 +205,7 @@ class Transcriber:
 
         if last_status == 429:
             # 每分鐘額度在等待 2 分鐘後應已恢復；仍然 429 代表是每日（或更長週期）的額度
-            raise QuotaExhausted(f"Gemini 額度不足，重試 {MAX_SEGMENT_ATTEMPTS} 次仍回傳 429：{last_error}")
+            raise QuotaExhausted(f"重試 {MAX_SEGMENT_ATTEMPTS} 次仍回傳 429：{last_error}")
         raise RuntimeError(f"Gemini 轉錄 {_hms(start)}–{_hms(end)} 重試 {MAX_SEGMENT_ATTEMPTS} 次仍失敗。最後錯誤：{last_error}")
 
     def _drop_fps(self, message: str) -> bool:

@@ -88,10 +88,12 @@ def run_check() -> int:
     if cfg.gemini_api_key:
         try:
             transcriber = Transcriber(cfg.gemini_api_key, cfg.gemini_model, cfg.segment_minutes,
-                                      cfg.video_fps, cfg.vocabulary)
-            ok(f"Gemini API 金鑰有效，可使用模型 {cfg.gemini_model}（{transcriber.check_model()}）")
+                                      cfg.video_fps, cfg.vocabulary, cfg.gemini_fallback_model)
+            names = transcriber.check_models()
+            ok(f"Gemini API 金鑰有效，主要模型 {names[0]}" + (f"，備援模型 {names[1]}" if len(names) > 1 else "，未設定備援模型"))
         except Exception as exc:
-            fail(f"Gemini API 失敗（模型 {cfg.gemini_model}）：{exc}")
+            models = " / ".join(m for m in (cfg.gemini_model, cfg.gemini_fallback_model) if m)
+            fail(f"Gemini API 失敗（模型 {models}）：{exc}")
 
     print("\n全部檢查通過，可以開始轉錄。" if problems == 0 else f"\n有 {problems} 項需要修正，請依上面的訊息調整後重新執行。")
     return 0 if problems == 0 else 1
@@ -141,7 +143,8 @@ def run_transcribe(args: argparse.Namespace) -> int:
                 log.info("%s %s 已經在試算表中，略過", s.episode_date, s.video_id)
         targets = [s for s in targets if s.video_id not in done]
 
-    transcriber = Transcriber(cfg.gemini_api_key, cfg.gemini_model, cfg.segment_minutes, cfg.video_fps, cfg.vocabulary)
+    transcriber = Transcriber(cfg.gemini_api_key, cfg.gemini_model, cfg.segment_minutes, cfg.video_fps, cfg.vocabulary,
+                              cfg.gemini_fallback_model)
     had_error = False
     for stream in targets:
         if not stream.is_ready(now, cfg.ready_delay_minutes):
@@ -160,10 +163,12 @@ def run_transcribe(args: argparse.Namespace) -> int:
         log.info("開始轉錄 %s（%d 分鐘）%s", stream.title, stream.duration_sec // 60, stream.url)
         try:
             text = transcriber.transcribe(stream.url, stream.duration_sec)
-            store.append_transcript(stream, text, cfg.gemini_model)
+            models = " + ".join(transcriber.models_used)
+            store.append_transcript(stream, text, models)
         except QuotaExhausted as exc:
-            log.error("%s", exc)
-            store.log(mode, stream, RESULT_QUOTA, str(exc))
+            message = f"所有模型（{' / '.join(transcriber.models)}）額度都用完：{exc}"
+            log.error("%s", message)
+            store.log(mode, stream, RESULT_QUOTA, message)
             had_error = True
             break  # 今天的配額用完，後面的影片也不用試了
         except Exception as exc:
@@ -172,8 +177,8 @@ def run_transcribe(args: argparse.Namespace) -> int:
             had_error = True
             continue
         chars = len("".join(text.split()))
-        log.info("完成：%s，共 %d 字，已寫入試算表", stream.title, chars)
-        store.log(mode, stream, RESULT_OK, f"{chars} 字")
+        log.info("完成：%s，共 %d 字（模型 %s），已寫入試算表", stream.title, chars, models)
+        store.log(mode, stream, RESULT_OK, f"{chars} 字，模型 {models}")
 
     return 1 if had_error else 0
 
