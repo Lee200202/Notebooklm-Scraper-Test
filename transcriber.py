@@ -7,6 +7,8 @@ Gemini 會自己「聽」影片的聲音來聽打。
 import logging
 import re
 import time
+from dataclasses import dataclass
+from typing import Any
 
 from google import genai
 
@@ -20,6 +22,15 @@ MIN_SPLIT_SECONDS = 5 * 60
 MAX_SEGMENT_ATTEMPTS = 3
 RETRY_WAIT_SECONDS = (30, 90)  # 第 2、3 次送出前的等待秒數；兩次合計超過 1 分鐘，可避開每分鐘額度限制
 NON_RETRYABLE_STATUS = {401, 403, 404}  # 金鑰無效、沒有權限、模型不存在：重試也不會成功
+
+
+@dataclass
+class StreamResult:
+    """串流模式的結果，欄位與 Interaction 相同，後續處理可共用。"""
+    status: str
+    output_text: str
+    usage: Any = None
+    errors: Any = None
 
 
 class QuotaExhausted(RuntimeError):
@@ -93,6 +104,9 @@ class Transcriber:
         self.segment_seconds = segment_minutes * 60
         self.video_fps = video_fps
         self.vocabulary = vocabulary
+        # 不支援背景模式（background）的模型，例如 gemini-3.5-flash-lite：偵測到後改用串流模式
+        self.stream_models: set[str] = set()
+        self.stage = "送出請求"
 
     @property
     def client(self) -> genai.Client:
@@ -190,22 +204,19 @@ class Transcriber:
             log.info("  Gemini 轉錄 %s–%s（第 %d 次%s%s）", _hms(start), _hms(end), attempt,
                      f"，fps={self.video_fps}" if use_fps else "", key_tag)
 
-            stage = "送出請求"
+            request = {
+                "model": self.model,
+                "system_instruction": SYSTEM_INSTRUCTION,
+                "input": [
+                    {"type": "video", "uri": video_url, "processing": processing, "resolution": "low"},
+                    {"type": "text", "text": prompt},
+                ],
+                "generation_config": {"thinking_level": "low", "max_output_tokens": 65536},
+            }
             try:
-                interaction = self.client.interactions.create(
-                    model=self.model,
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    input=[
-                        {"type": "video", "uri": video_url, "processing": processing, "resolution": "low"},
-                        {"type": "text", "text": prompt},
-                    ],
-                    generation_config={"thinking_level": "low", "max_output_tokens": 65536},
-                    # 長影片處理時間久，用背景模式再輪詢結果，避免連線逾時
-                    background=True,
-                )
-                stage = "等待結果"
-                interaction = self._wait(interaction)
+                interaction = self._run(request)
             except Exception as exc:
+                stage = self.stage
                 status, message = _error_details(exc)
                 is_quota_403 = status == 403 and any(k in message.lower() for k in ("quota", "exhausted", "ratelimit", "rate_limit"))
                 if status in NON_RETRYABLE_STATUS and not is_quota_403:
@@ -266,6 +277,56 @@ class Transcriber:
         else:
             log.warning("  這一段改成不指定 fps 重送（fps 會讓部分影片片段處理失敗）")
         return False
+
+    def _run(self, request: dict):
+        """送出請求並取得結果。
+
+        長影片處理時間久，預設用背景模式（background）再輪詢結果，避免連線逾時。
+        部分模型（例如 gemini-3.5-flash-lite）不支援背景模式，會立即回傳 HTTP 400
+        「does not support background interactions」——這種請求沒有被處理、不佔額度，
+        所以直接改用串流模式重送，不算一次重試，之後這個模型都用串流。
+        """
+        if request["model"] not in self.stream_models:
+            self.stage = "送出請求"
+            try:
+                interaction = self.client.interactions.create(**request, background=True)
+            except Exception as exc:
+                status, message = _error_details(exc)
+                if not (status == 400 and "does not support background" in message.lower()):
+                    raise
+                self.stream_models.add(request["model"])
+                log.info("  模型 %s 不支援背景模式，改用串流模式接收結果", request["model"])
+            else:
+                self.stage = "等待結果"
+                return self._wait(interaction)
+        return self._stream(request)
+
+    def _stream(self, request: dict) -> StreamResult:
+        """串流模式：連線保持開啟，邊接收邊累積文字，直到 interaction.completed。"""
+        self.stage = "串流接收結果"
+        stream = self.client.interactions.create(**request, stream=True, timeout=SEGMENT_TIMEOUT_SECONDS)
+        parts: list[str] = []
+        completed = None
+        try:
+            for event in stream:
+                event_type = getattr(event, "event_type", None)
+                if event_type == "step.delta":
+                    delta = getattr(event, "delta", None)
+                    if getattr(delta, "type", None) == "text":
+                        parts.append(getattr(delta, "text", "") or "")
+                elif event_type == "interaction.completed":
+                    completed = getattr(event, "interaction", None)
+                elif event_type == "error":
+                    error = getattr(event, "error", None)
+                    return StreamResult(status="failed", output_text="", errors=error)
+        finally:
+            close = getattr(stream, "close", None)
+            if close:
+                close()
+        if completed is None:
+            raise RuntimeError("串流在收到完成事件前中斷")
+        text = "".join(parts) or _output_text(completed)
+        return StreamResult(status=str(completed.status), output_text=text, usage=getattr(completed, "usage", None))
 
     def _wait(self, interaction):
         deadline = time.monotonic() + SEGMENT_TIMEOUT_SECONDS

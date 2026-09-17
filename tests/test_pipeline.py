@@ -53,6 +53,7 @@ class FakeGemini(BaseHTTPRequestHandler):
     daily_quota = False
     final_status = staticmethod(lambda index: "completed")  # 第 index 個請求的最終狀態
     post_error = staticmethod(lambda call_no, body: None)    # 回傳 (HTTP 狀態碼, JSON) 模擬送出失敗
+    no_background_models: set = set()                        # 不支援背景模式的模型（只能用串流）
     poll_error = staticmethod(lambda index, count: None)     # 回傳 (HTTP 狀態碼, JSON) 模擬輪詢失敗
 
     def log_message(self, *args):
@@ -80,10 +81,35 @@ class FakeGemini(BaseHTTPRequestHandler):
         video = body["input"][0]["content"][0]
         if cls.reject_fps and "fps" in video.get("processing", {}):
             return self._send(400, {"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": "Invalid fps"}})
+        if body.get("background") and body["model"] in cls.no_background_models:
+            # 實際在 GitHub 上收到的錯誤
+            return self._send(400, {"error": {
+                "message": f"Model '{body['model']}' does not support background interactions.", "code": "invalid_request"}})
+        if body.get("stream"):
+            cls.requests.append(body)
+            return self._send_stream(video["processing"])
         cls.requests.append(body)
         interaction_id = f"int-{len(cls.requests)}"
         cls.polls[interaction_id] = {"count": 0, "index": len(cls.requests) - 1, "processing": video["processing"]}
         self._send(200, {"id": interaction_id, "status": "in_progress"})
+
+    def _send_stream(self, processing):
+        text = f"{processing['start_offset']}-{processing['end_offset']} 台積電 2330 漲 3.5%。"
+        events = [
+            {"event_type": "interaction.created", "interaction": {"id": "stream-1", "status": "in_progress"}},
+            {"event_type": "step.delta", "index": 0, "delta": {"type": "text", "text": text[:10]}},
+            {"event_type": "step.delta", "index": 0, "delta": {"type": "text", "text": text[10:]}},
+            {"event_type": "interaction.completed", "interaction": {
+                "id": "stream-1", "status": "completed",
+                "usage": {"total_input_tokens": 80000, "total_output_tokens": 9000, "total_thought_tokens": 0}}},
+        ]
+        body = "".join(f"data: {json.dumps(e, ensure_ascii=False)}\n\n" for e in events) + "data: [DONE]\n\n"
+        raw = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -226,6 +252,7 @@ class PipelineTest(unittest.TestCase):
         FakeGemini.post_error = staticmethod(lambda call_no, body: None)
         FakeGemini.poll_error = staticmethod(lambda index, count: None)
         FakeSMTP.sent, FakeSMTP.logins, FakeSMTP.fail_login = [], [], False
+        FakeGemini.no_background_models = set()
         self.book = FakeSpreadsheet()
         self.videos = {}
         self.today = datetime.now(TAIPEI).date()
@@ -810,6 +837,25 @@ class PipelineTest(unittest.TestCase):
                 self.set_channel()
                 self.assertEqual(main.main(["--mode", "check"]), 1)
             self.assertIn("MAIL_USERNAME 和 MAIL_APP_PASSWORD 要一起設定", out.getvalue())
+
+    def test_model_without_background_support_switches_to_streaming(self):
+        # 重現 GitHub 上的錯誤：gemini-3.5-flash-lite 不支援 background=True
+        self.set_channel(count=1)
+        FakeGemini.no_background_models = {MODEL}
+        with self.assertLogs("transcriber", level="INFO") as transcriber_logs:
+            code, _ = self.run_main("--video-id", TODAY)
+        self.assertEqual(code, 0)
+        # 第 1 段：背景模式被拒絕（不算重試、不等待）→ 串流成功；之後的片段直接用串流
+        self.assertEqual(FakeGemini.post_calls, 4)
+        self.assertEqual([bool(r.get("stream")) for r in FakeGemini.requests], [True, True, True])
+        self.assertTrue(all(not r.get("background") for r in FakeGemini.requests))
+        logs = " | ".join(transcriber_logs.output)
+        self.assertEqual(logs.count("不支援背景模式，改用串流模式"), 1)
+        self.assertNotIn("秒後重新送出", logs)
+        row = self.rows()[0]
+        self.assertEqual(row[3], TODAY)
+        self.assertIn("0s-1800s 台積電 2330 漲 3.5%。", row[11])  # 分段收到的文字有完整接起來
+        self.assertIn("3600s-3995s", row[11])
 
     def test_invalid_video_id_is_rejected(self):
         with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
