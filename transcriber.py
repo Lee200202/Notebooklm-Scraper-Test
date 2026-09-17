@@ -78,7 +78,12 @@ class Transcriber:
         else:
             raw_keys = []
         self.api_keys = [k for k in raw_keys if k] or [""]
-        self.clients = [genai.Client(api_key=k) for k in self.api_keys]
+        self.clients = []
+        for k in self.api_keys:
+            client = genai.Client(api_key=k or "dummy", http_options={"retry_options": {"attempts": 1}})
+            if hasattr(client, "interactions") and hasattr(client.interactions, "sdk_configuration"):
+                client.interactions.sdk_configuration.retry_config = None
+            self.clients.append(client)
         self.key_index = 0
         # 額度是「每個模型分開計算」：主要模型額度用完時，改用備援模型繼續
         self.models = [model] + ([fallback_model] if fallback_model and fallback_model != model else [])
@@ -210,6 +215,9 @@ class Transcriber:
                     detail = _quota_summary(message) or message[:300]
                     if _is_daily_quota(message) or is_quota_403:
                         raise QuotaExhausted(f"每日額度已用完：{detail}") from exc
+                    # 重試 1 次仍回傳 429 就換鑰匙（第 1 次失敗等待重送，第 2 次仍 429 即判定額度耗盡換金鑰）
+                    if attempt >= 2:
+                        raise QuotaExhausted(f"重試 1 次仍回傳 429：{detail}") from exc
                 else:
                     detail = message[:300]
                 last_error, last_status = f"{stage}時發生錯誤（HTTP {status}，模型 {self.model}）：{detail}", status
@@ -242,8 +250,8 @@ class Transcriber:
                 use_fps = self._drop_fps(last_error)
 
         if last_status == 429:
-            # 每分鐘額度在等待 2 分鐘後應已恢復；仍然 429 代表是每日（或更長週期）的額度
-            raise QuotaExhausted(f"重試 {MAX_SEGMENT_ATTEMPTS} 次仍回傳 429：{last_error}")
+            # 每分鐘額度在等待後應已恢復；仍然 429 代表是每日（或更長週期）的額度
+            raise QuotaExhausted(f"重試 1 次仍回傳 429：{last_error}")
         raise RuntimeError(f"Gemini 轉錄 {_hms(start)}–{_hms(end)} 重試 {MAX_SEGMENT_ATTEMPTS} 次仍失敗。最後錯誤：{last_error}")
 
     def _drop_fps(self, message: str) -> bool:

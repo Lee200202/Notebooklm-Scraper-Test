@@ -31,8 +31,8 @@ from config import TAIPEI, ConfigError  # noqa: E402
 
 REAL_YOUTUBE_GET = youtube_client.YouTubeClient._get
 
-MODEL = "gemini-3.8-flash"
-FALLBACK = "gemini-3.5-flash-lite"
+MODEL = "gemini-3.5-flash-lite"
+FALLBACK = "gemini-1.5-pro"
 TODAY = "todayVideo1"  # YouTube 影片 ID 固定 11 碼
 SERVICE_ACCOUNT = {
     "type": "service_account",
@@ -88,7 +88,8 @@ class FakeGemini(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
         if "/models/" in path:
-            return self._send(200, {"name": f"models/{MODEL}", "displayName": "Gemini 3.8 Flash"})
+            m_name = path.rstrip("/").split("/")[-1]
+            return self._send(200, {"name": f"models/{m_name}", "displayName": m_name})
         interaction_id = path.rstrip("/").split("/")[-1]
         state = type(self).polls[interaction_id]
         state["count"] += 1
@@ -242,8 +243,15 @@ class PipelineTest(unittest.TestCase):
                 "GITHUB_REPOSITORY": "owner/repo", "GITHUB_EVENT_NAME": "",
             }),
             mock.patch.object(notifier.smtplib, "SMTP_SSL", FakeSMTP),
-            mock.patch.object(transcriber.genai, "Client",
-                              lambda api_key: real_client(api_key=api_key, http_options={"base_url": base_url})),
+            mock.patch.object(
+                transcriber.genai,
+                "Client",
+                lambda api_key, **kw: (
+                    (lambda c: (setattr(c.interactions.sdk_configuration, "retry_config", None), c)[1])(
+                        real_client(api_key=api_key, http_options={"base_url": base_url, "retry_options": {"attempts": 1}})
+                    )
+                ),
+            ),
             mock.patch.object(transcriber, "POLL_SECONDS", 0),
             mock.patch.object(transcriber.time, "sleep", lambda seconds: None),
             mock.patch.object(youtube_client.YouTubeClient, "_get", self._fake_youtube),
@@ -463,23 +471,25 @@ class PipelineTest(unittest.TestCase):
         self.assertFalse(transcriber._is_daily_quota(message))  # 訊息裡沒有 per day 字樣，只能靠持續 429 判斷
 
     def test_primary_quota_exhausted_switches_to_fallback_model(self):
-        # 重現 GitHub 上的情況：第一段成功後主要模型額度用完 → 改用 flash-lite 完成剩下的片段與影片
+        # 重現 GitHub 上的情況：第一段成功後主要模型額度用完 → 改用備援模型完成剩下的片段與影片
         self.set_channel(count=2)
         FakeGemini.post_error = staticmethod(
             lambda call_no, body: QUOTA_EXCEEDED if body["model"] == MODEL and call_no > 1 else None)
-        with self.assertLogs("transcriber", level="WARNING") as transcriber_logs:
+        with mock.patch.dict(os.environ, {"GEMINI_FALLBACK_MODEL": FALLBACK}), \
+                self.assertLogs("transcriber", level="WARNING") as transcriber_logs:
             code, _ = self.run_main("--mode", "init")
         self.assertEqual(code, 0)
         self.assertEqual([r["model"] for r in FakeGemini.requests], [MODEL] + [FALLBACK] * 5)
         self.assertEqual([r[9] for r in self.rows()], [f"{MODEL} + {FALLBACK}", FALLBACK])  # 「模型」欄
         warnings = " | ".join(transcriber_logs.output)
-        self.assertIn("改用備援模型 gemini-3.5-flash-lite", warnings)
+        self.assertIn(f"改用備援模型 {FALLBACK}", warnings)
         self.assertIn("limit: 20, model: gemini-3.8-flash", warnings)  # 完整印出是哪一種額度
 
     def test_all_models_exhausted_stops_the_run(self):
         self.set_channel()
         FakeGemini.post_error = staticmethod(lambda call_no, body: QUOTA_EXCEEDED)
-        self.assertEqual(self.run_main("--mode", "init")[0], 1)
+        with mock.patch.dict(os.environ, {"GEMINI_FALLBACK_MODEL": FALLBACK}):
+            self.assertEqual(self.run_main("--mode", "init")[0], 1)
         self.assertEqual(self.log_results(), ["配額不足"])  # 只記一次，後面的影片不再嘗試
         self.assertIn(f"{MODEL} / {FALLBACK}", self.book.sheets["執行紀錄"].rows[-1][5])
         self.assertEqual(self.rows(), [])
@@ -536,14 +546,14 @@ class PipelineTest(unittest.TestCase):
         FakeGemini.post_error = staticmethod(
             lambda call_no, body: QUOTA_EXCEEDED if body["model"] == MODEL else None
         )
-        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "key-1", "GEMINI_API_KEY_2": "key-2"}), \
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "key-1", "GEMINI_API_KEY_2": "key-2", "GEMINI_FALLBACK_MODEL": FALLBACK}), \
                 self.assertLogs("transcriber", level="WARNING") as transcriber_logs:
             code, _ = self.run_main("--video-id", TODAY)
         self.assertEqual(code, 0)
         self.assertEqual([r["model"] for r in FakeGemini.requests], [FALLBACK] * 3)
         warnings = " | ".join(transcriber_logs.output)
-        self.assertIn("所有 API 金鑰在 gemini-3.8-flash 的額度均已用完", warnings)
-        self.assertIn("改用備援模型 gemini-3.5-flash-lite", warnings)
+        self.assertIn(f"所有 API 金鑰在 {MODEL} 的額度均已用完", warnings)
+        self.assertIn(f"改用備援模型 {FALLBACK}", warnings)
 
     def test_youtube_client_multi_key_rotation(self):
         # 模擬 YouTubeClient 在第 1 組金鑰遇到 403 quotaExceeded 時自動切換到第 2 組
@@ -583,9 +593,33 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(code, 0, out.getvalue())
         self.assertEqual(out.getvalue().count("✅"), 4)
         self.assertIn(f"主要模型 {MODEL}", out.getvalue())
-        self.assertIn(f"備援模型 {FALLBACK}", out.getvalue())
+        self.assertIn("未設定備援模型", out.getvalue())
         self.assertEqual(self.log_results(), ["設定檢查通過"])
         self.assertEqual(FakeGemini.requests, [])  # 檢查不會用掉生成額度
+
+    def test_retry_once_429_immediately_switches_key(self):
+        # 驗證「重試 1 次仍回傳 429 就換鑰匙」：Key 1 遇到 429 後重試 1 次（共 2 次），仍 429 則立刻換 Key 2，不嘗試第 3 次
+        self.set_channel(count=1)
+        key1_calls = 0
+
+        def custom_error(call_no, body):
+            nonlocal key1_calls
+            if body.get("_api_key") == "key-1":
+                key1_calls += 1
+                return QUOTA_EXCEEDED
+            return None
+
+        FakeGemini.post_error = staticmethod(custom_error)
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "key-1", "GEMINI_API_KEY_2": "key-2"}), \
+                self.assertLogs("transcriber", level="WARNING") as transcriber_logs:
+            code, _ = self.run_main("--video-id", TODAY)
+        self.assertEqual(code, 0)
+        # Key 1 只能有 2 次嘗試（初次 + 1 次重試），不能有第 3 次
+        self.assertEqual(key1_calls, 2)
+        warnings = " | ".join(transcriber_logs.output)
+        self.assertIn("API 金鑰 #1 額度用完", warnings)
+        self.assertIn("重試 1 次仍回傳 429", warnings)
+        self.assertIn("馬上切換到 API 金鑰 #2 繼續", warnings)
 
     def test_check_mode_lists_all_missing_secrets(self):
         self.set_channel()

@@ -10,7 +10,7 @@ GitHub Actions 排程（週一～五 11:10 啟動 → 程式等到 11:20，每 3
    │
    ├─ YouTube Data API：今天的直播結束了嗎？ ── 還沒 → 結束，5 分鐘後再查
    ├─ Google 試算表：今天這集寫過了嗎？      ── 寫過 → 結束
-   ├─ Gemini API（gemini-3.8-flash，額度用完改用 gemini-3.5-flash-lite）：直接讀 YouTube 網址，每 30 分鐘切一段聽打
+   ├─ Gemini API（預設 gemini-3.5-flash-lite，支援多組 API 金鑰輪替）：直接讀 YouTube 網址，每 30 分鐘切一段聽打
    └─ 寫入試算表「逐字稿」＋「執行紀錄」
 ```
 
@@ -140,8 +140,8 @@ bash setup.sh
 > 2. **重要提醒**：若多組金鑰建在同一個 Google Cloud 專案內，其每日額度是共用的；建在**不同專案**或**不同 Google 帳號**下，每組金鑰才能享有獨立完整的免費額度！
 >
 > 🔄 **自動切換機制說明**：
-> - 轉錄進行中，若第 1 組金鑰遇到每日配額用盡（429 Resource Exhausted）或帳單上限，系統會**立刻自動切換到第 2 組金鑰**，並維持高品質的 `gemini-3.8-flash` 主要模型繼續轉錄，不會中斷。
-> - 只有當**所有** API 金鑰在主要模型的額度都耗盡時，才會切換至備援模型（`gemini-3.5-flash-lite`），並自動循環回到第 1 組金鑰繼續處理。
+> - 轉錄進行中，若第 1 組金鑰遇到 429 配額問題，程式在**等待 30 秒重試 1 次後若仍為 429，便會立刻自動切換到第 2 組金鑰**繼續轉錄，絕不浪費時間多餘空等。
+> - 維持主要模型 `gemini-3.5-flash-lite` 繼續轉錄；若有設定備援模型（選填），只有當**所有** API 金鑰在主要模型的額度都耗盡時，才會切換至備援模型。
 > - 你也可以將多組金鑰以半形逗號分隔直接填在 `GEMINI_API_KEY`，或設定為 `GEMINI_API_KEYS`，程式皆能智慧解析。
 
 ### 步驟 4-2：設定寄信通知（選填，建議）
@@ -178,7 +178,7 @@ bash setup.sh
      2026-09-17  r5YtdmBoMEA   66 分鐘  可轉錄  2026/09/17(四)張震  股市盤中家教班
      ...
 ✅ Google 試算表可讀寫，目前已有 0 集逐字稿（「執行紀錄」已新增一列檢查紀錄）
-✅ Gemini API 金鑰有效，主要模型 gemini-3.8-flash（Gemini 3.8 Flash），備援模型 gemini-3.5-flash-lite（…）
+✅ Gemini API 金鑰有效（共 2 組金鑰已啟用備援輪替），主要模型 gemini-3.5-flash-lite（Gemini 3.5 Flash Lite），未設定備援模型
 ✅ Gmail 寄信正常，已寄出測試信給 1 位收件者，請到信箱確認
 
 全部檢查通過，可以開始轉錄。
@@ -240,8 +240,8 @@ bash setup.sh
 
 | Name | 預設 | 說明 |
 |---|---|---|
-| `GEMINI_MODEL` | `gemini-3.8-flash` | 主要模型。想全部用便宜的模型可以改成 `gemini-3.5-flash-lite` |
-| `GEMINI_FALLBACK_MODEL` | `gemini-3.5-flash-lite` | 主要模型額度用完時改用的模型；設成 `none` 則不使用備援 |
+| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | 主要模型。預設為輕量、高額度的 `gemini-3.5-flash-lite` |
+| `GEMINI_FALLBACK_MODEL` | 空白（不使用備援） | 主要模型額度用完時改用的備援模型（如需備援可設為 `gemini-3.8-flash` 等）；設成 `none` 或空白則不使用備援 |
 | `SEGMENT_MINUTES` | `30` | 每段長度（至少 5）。改小聽打會更完整，但請求次數會增加 |
 | `VIDEO_FPS` | `0`（不指定） | 畫面取樣率。**建議不要設定**：實測設 `0.2` 可省約 6 成 token，但部分影片片段會一直回傳 400 錯誤（設定後程式遇到失敗會自動改成不帶 fps 重送，但會多用請求次數） |
 | `INIT_VIDEO_COUNT` | `5` | init 補抓幾集 |
@@ -262,20 +262,19 @@ bash setup.sh
 
 | 服務 | 用量 | 費用 |
 |---|---|---|
-| Gemini API（免費方案） | 每集約 3 次請求（每 30 分鐘一段） | gemini-3.8-flash 每天約 20 次；額度用完自動改用 gemini-3.5-flash-lite（另一份額度） |
-| Gemini API（付費方案） | 每集約 33～39 萬輸入 token、1 萬輸出 token | 依 2026 年牌價估算：gemini-3.8-flash 約 US$0.3／集、gemini-3.5-flash-lite 約 US$0.13／集 |
+| Gemini API（免費方案） | 每集約 3 次請求（每 30 分鐘一段） | gemini-3.5-flash-lite 支援多組 API 金鑰輪替（遇到 429 重試 1 次仍失敗馬上換 Key） |
+| Gemini API（付費方案） | 每集約 33～39 萬輸入 token、1 萬輸出 token | 依 2026 年牌價估算：gemini-3.5-flash-lite 約 US$0.13／集、gemini-3.8-flash 約 US$0.3／集 |
 | YouTube Data API | 每次檢查 3 單位，每天約 100 單位 | 免費（每天上限 10,000） |
 | Google Sheets API | 很少 | 免費 |
 | GitHub Actions | 主要那次約 20～30 分鐘（含 11:10～11:20 的等待），備援與補跑約 12 次、每次約 1 分鐘 | 公開 repo 免費；Private repo 每月約用 700～1,000 分鐘，在 2,000 分鐘內 |
 
 **Gemini 額度的重點**
 
-- **額度按「專案＋模型」計算，不是按 API 金鑰**：同一個專案建立再多把金鑰，額度都一樣。不同模型各有一份額度，所以主要模型用完時，程式會自動改用備援模型（預設 `gemini-3.5-flash-lite`），不用等隔天。
+- **額度按「專案＋模型」計算**：若需多份獨立額度，金鑰需建在不同 GCP 專案或 Google 帳號下。本專案支援設定多組 API 金鑰（如 `GEMINI_API_KEY_2`、`GEMINI_API_KEYS`），遇到 429 配額限制時，重試 1 次仍超額便自動換下一組金鑰繼續。
 - **每日額度在太平洋時間午夜重置，也就是台灣時間 15:00（美國冬令時間期間是 16:00），不是台灣午夜**。
   - 例如：晚上手動補抓用掉的額度，和**隔天早上 11:20 的排程**算在同一天。
   - 所以排程在 15:10～16:40 另外加跑 4 次，早上因額度不足沒抓到的話，重置後會自動補。
 - 真的需要更多額度：在 AI Studio 替專案[綁定帳單](https://aistudio.google.com/projects)（Tier 1），額度會提高很多；依上表估算，每月 22 集約 US$3～7。
-- **不要用多個 Google 帳號（或多個專案）的金鑰輪流使用來疊加免費額度**。Gemini API 條款引用的 [Google APIs 服務條款](https://developers.google.com/terms)規定不得規避 API 的使用限制，違反可能導致相關帳號被停權。本專案刻意只支援一組 `GEMINI_API_KEY`。
 - 實際額度以 [AI Studio 額度頁面](https://aistudio.google.com/rate-limit) 為準（可以切換模型查看）。
 - 免費方案的輸入內容可能會被 Google 用來改善產品，付費方案不會。
 
@@ -316,9 +315,8 @@ base64 -w0 key.json; echo; rm -f key.json
 程式印出的時間是台灣時間。GitHub 介面左側另外顯示的時間戳記則是 UTC。
 
 **Q：log 出現「HTTP 429 … You exceeded your current quota」？**
-表示 Gemini 額度用完。log 會印出是哪一種額度，例如 `generate_content_free_tier_requests, limit: 20, model: gemini-3.8-flash` 就是該模型的每日請求數。
-程式會等 30 秒、90 秒重試；仍然 429 就改用備援模型繼續。備援模型也用完，就記錄「配額不足」並停止，等 15:00 或 16:00 額度重置後的排程補跑。
-「模型」欄會記錄這集實際用了哪些模型，例如 `gemini-3.8-flash + gemini-3.5-flash-lite`。
+表示 Gemini 額度超額。程式會在等候 30 秒並重試 1 次後，若依然 429 便**馬上切換到下一組 API 金鑰**繼續轉錄。若所有金鑰在主要模型皆耗盡，才會切換至備援模型（若有設定）。若所有金鑰與模型額度皆耗盡，才會記錄「配額不足」並停止，等 15:00 或 16:00 額度重置後的排程補跑。
+「模型」欄會記錄這集實際用了哪些模型。
 
 **Q：沒收到通知信？**
 依序確認：

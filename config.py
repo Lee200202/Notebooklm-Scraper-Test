@@ -76,7 +76,7 @@ def _clock(name: str, default: str) -> time:
 
 
 def _fallback_model() -> str:
-    value = env("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
+    value = env("GEMINI_FALLBACK_MODEL", "")
     return "" if value.lower() in ("none", "off", "false", "0", "-") else value
 
 
@@ -226,9 +226,8 @@ def load_settings(strict: bool = True) -> Settings:
         poll_end=_clock("POLL_END", "14:00"),
         poll_interval_minutes=_number("POLL_INTERVAL_MINUTES", 3, int, 1),
         gemini_api_key=gemini_keys[0] if gemini_keys else env("GEMINI_API_KEY"),
-        gemini_model=env("GEMINI_MODEL", "gemini-3.8-flash"),
-        # 主要模型額度用完時改用的模型。額度按模型分開計算，flash-lite 免費額度較多、也比較便宜。
-        # 設成 none 可停用備援
+        gemini_model=env("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+        # 主要模型額度用完時改用的模型。設成 none 或空白可停用備援
         gemini_fallback_model=_fallback_model(),
         # 每段送給 Gemini 的影片長度；免費方案每天約 20 次請求，30 分鐘一段最省
         segment_minutes=_number("SEGMENT_MINUTES", 30, int, 5),
